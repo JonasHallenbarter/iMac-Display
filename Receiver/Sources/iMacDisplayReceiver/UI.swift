@@ -18,6 +18,7 @@ final class AppModel: ObservableObject {
     private(set) var facts = Facts()
     let monitor = MonitorController()
     let power = PowerController()
+    let autoShutdown = AutoShutdown()
     private let reach = Reachability()
     private var reachState: ReachState = .unknown
     private var timer: Timer?
@@ -34,12 +35,31 @@ final class AppModel: ObservableObject {
         monitor.onChange = { [weak self] in self?.refresh(quick: true) }
         monitor.onStarted = { [weak self] in self?.onHideWindow?() }
         monitor.onUserExit = { [weak self] in self?.refresh(quick: true); self?.onShowWindow?() }
+        autoShutdown.pictureShowing = { [weak self] in self?.monitor.player?.showingVideo ?? false }
+        autoShutdown.player = { [weak self] in self?.monitor.player }
+        autoShutdown.onChange = { [weak self] in self?.autoShutdownChanged() }
+        autoShutdown.onCountdownActive = { [weak self] on in self?.power.setCountdown(on) }
+        autoShutdown.beforeShutdown = { [weak self] in
+            self?.power.releaseAll()
+            Log.write("Energie-Assertions vor dem Ausschalten freigegeben")
+        }
+    }
+
+    /// Zeile „Automatisch ausschalten“ nur neu aufbauen, wenn sich ihr Text ändert (der Zustand tickt 4×/s)
+    private func autoShutdownChanged() {
+        facts.autoShutdown = autoShutdown.info
+        updatePower()
+        let item = Checks.autoShutdown(facts)
+        if let old = checks.first(where: { $0.id == item.id }), old.detail == item.detail, old.status == item.status,
+           old.hint == item.hint, old.actions == item.actions, old.toggle?.isOn == item.toggle?.isOn { return }
+        checks = Checks.build(facts)
     }
 
     var networkChangedByUs: Bool { facts.backup != nil || facts.primary?.config?.isOurs == true }
 
     func start() {
         DecoderProbe.start { [weak self] in self?.refresh(quick: true) }
+        autoShutdown.start()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
         if Config.dryRun, let dir = Config.env["IMAC_RECEIVER_TEST_DIR"] {
@@ -50,6 +70,7 @@ final class AppModel: ObservableObject {
     /// Beim Beenden: Player schließen, alle Energie-Assertions freigeben.
     func shutdown() {
         timer?.invalidate(); testTimer?.invalidate()
+        autoShutdown.stop()
         monitor.stopAndWait()
         power.releaseAll()
     }
@@ -60,13 +81,16 @@ final class AppModel: ObservableObject {
         var ok = false
         if case .ok = reachState { ok = true }
         let before = power.heldCount
-        power.update(reachable: ok, active: monitorActive)
+        if autoShutdown.isShuttingDown { power.releaseAll(); return }      // Ausschalten läuft: nichts mehr festhalten
+        power.update(reachable: ok, active: monitorActive, shutdownTimer: autoShutdown.holdsSystemAwake)
         if power.heldCount != before { Log.write("Energie-Assertions gehalten: \(power.heldCount)") }
     }
 
     func refresh(quick: Bool = false) {
         guard !preview else { return }
         facts = Facts.current(monitor: monitor.state, reach: reachState, picture: monitor.picture)
+        facts.autoShutdown = autoShutdown.info
+        facts.brightness = BrightnessInfo.current()
         checks = Checks.build(facts)
         updatePower()
         if quick { return }
@@ -113,6 +137,21 @@ final class AppModel: ObservableObject {
             showLog()
         case .removeLegacyAutostart:
             notice = "Alte Skript-Installation: " + Autostart.removeLegacy()
+        case .enableAutoShutdown:
+            autoShutdown.enabled = true
+            notice = "Automatisch ausschalten ist an: nach \(AutoShutdown.duration(Config.shutdownIdle)) ohne Bild und ohne Eingabe."
+            if SystemShutdown.blockReason == nil { autoShutdown.checkPermission(ask: false) }
+        case .disableAutoShutdown:
+            autoShutdown.enabled = false
+            notice = "Automatisch ausschalten ist aus."
+        case .cancelShutdown:
+            autoShutdown.cancelCountdown()
+        case .requestShutdownPermission:
+            autoShutdown.checkPermission(ask: true)          // macOS-Dialog (nicht im Testmodus)
+        case .checkShutdownPermission:
+            autoShutdown.checkPermission(ask: false)
+        case .openAutomationPrefs:
+            NSWorkspace.shared.open(SystemShutdown.automationPrefsURL)
         }
         refresh()
     }
@@ -191,7 +230,9 @@ final class AppModel: ObservableObject {
 //
 // <dir>/cmd: eine Zeile pro Befehl – Name einer CheckAction (genau der Weg der Buttons), "dump",
 // "uninstall [autostart] [network] [data] [trashApp]", "closeWindow", "player" (Player-Zustand als JSON),
-// "key <zeichen|esc> [cmd]" (Tastendruck wie von der Tastatur, z. B. „key q cmd“ = Cmd+Q), "showWindow", "quit".
+// "key <zeichen|esc> [cmd]" (Tastendruck wie von der Tastatur, z. B. „key q cmd“ = Cmd+Q), "showWindow", "quit",
+// "shutdown" (Zustand „Automatisch ausschalten“ als JSON), "fakeIdle <s>" / "fakeInput" / "realIdle" (Eingabe-Leerlauf
+// vorgeben bzw. „Maus bewegt“), "brightness" (Helligkeit lesen).
 // Ergebnisse werden an <dir>/out.txt angehängt.
 
 extension AppModel {
@@ -234,6 +275,23 @@ extension AppModel {
                     NSApp.sendEvent(e)
                 }
                 out += "keyWindow=\(target?.title ?? "-") monitor=\(monitor.state) window=\(windowVisible() ? "sichtbar" : "versteckt")\n"
+            } else if parts[0] == "shutdown" {
+                if let d = try? JSONSerialization.data(withJSONObject: autoShutdown.snapshot, options: [.sortedKeys]) {
+                    out += String(decoding: d, as: UTF8.self) + "\n"
+                }
+            } else if parts[0] == "fakeIdle", parts.count >= 2, let v = Double(parts[1]) {
+                InputIdle.setFake(v)
+                out += "inputIdle=\(InputIdle.seconds())\n"
+            } else if parts[0] == "fakeInput" {
+                InputIdle.setFake(0)                          // „Maus bewegt“
+                autoShutdown.tick()
+                out += "inputIdle=\(InputIdle.seconds())\n"
+            } else if parts[0] == "realIdle" {
+                InputIdle.setFake(nil)
+                out += "inputIdle=\(InputIdle.seconds())\n"
+            } else if parts[0] == "brightness" {
+                let b = BrightnessInfo.current()
+                out += "supported=\(b.supported) value=\(b.value.map { String(format: "%.3f", $0) } ?? "nil") method=\(b.method)\n"
             } else if parts[0] == "showWindow" {
                 onShowWindow?()
                 out += "window=\(windowVisible() ? "sichtbar" : "versteckt")\n"
@@ -292,7 +350,16 @@ struct CheckRow: View {
                 .foregroundColor(item.status.color)
                 .frame(width: 24)
             VStack(alignment: .leading, spacing: 4) {
-                Text(item.title).font(.headline)
+                if let t = item.toggle {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(item.title).font(.headline)
+                        Spacer(minLength: 8)
+                        Toggle("", isOn: Binding(get: { t.isOn }, set: { perform($0 ? t.on : t.off) }))
+                            .toggleStyle(.switch).labelsHidden()
+                    }
+                } else {
+                    Text(item.title).font(.headline)
+                }
                 Text(item.detail).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                 if let hint = item.hint {
                     (Text("Was tun? ").bold() + Text(hint))
@@ -321,7 +388,7 @@ struct CheckRow: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
     }
 }
 
@@ -532,11 +599,16 @@ enum PreviewRenderer {
                                 config: IPv4Config(method: "Manual", addresses: [Config.myIP], masks: [Config.netmask]))
         var all = Facts(); all.decoder = .hardware(ms: 14); all.wired = [ok]; all.reach = .ok(200); all.monitor = .off; all.autostart = .on
         all.backup = NetworkBackup(service: "Ethernet", previous: IPv4Config(method: "DHCP"), savedAt: Date()); all.autoLogin = "imac"
+        all.brightness = BrightnessInfo(supported: true, value: 0.62, method: "DisplayServices")
+        all.autoShutdown = AutoShutdownInfo(enabled: true, phase: .waiting(remaining: 7 * 60 - 20), permission: .granted,
+                                            idleLimit: 600, countdownLength: 60)
 
         var running = all; running.monitor = .running
         running.picture = .playing(fps: 52, width: 4096, height: 2304, hardware: true)
+        running.autoShutdown.phase = .picture
 
         var waiting = running; waiting.picture = .waiting(connected: false); waiting.reach = .fail("Zeitüberschreitung")
+        waiting.autoShutdown.phase = .waiting(remaining: 9 * 60)
 
         var software = all; software.decoder = .software(ms: 230)
 
@@ -545,6 +617,9 @@ enum PreviewRenderer {
         var firstRun = Facts(); firstRun.decoder = .hardware(ms: 14); firstRun.reach = .fail("x")
         firstRun.wired = [WiredInterface(bsd: "en0", name: "Ethernet", linkActive: true, ipv4: ["169.254.12.7"], service: "Ethernet",
                                          config: IPv4Config(method: "DHCP"))]
+        firstRun.brightness = BrightnessInfo(supported: true, value: 0.8, method: "IOKit")
+        firstRun.autoShutdown = AutoShutdownInfo(enabled: true, phase: .waiting(remaining: 600), permission: .needsConsent,
+                                                 idleLimit: 600, countdownLength: 60)
 
         var noCable = firstRun
         noCable.wired = [WiredInterface(bsd: "en0", name: "Ethernet", linkActive: false, ipv4: [], service: "Ethernet", config: IPv4Config(method: "DHCP"))]
@@ -554,34 +629,116 @@ enum PreviewRenderer {
 
         var legacy = all; legacy.legacyAgent = true
 
+        var countdown = waiting; countdown.autoShutdown.phase = .countdown(remaining: 42)
+
+        var denied = all
+        denied.autoShutdown.lastResult = .failed(code: -1743, message: SystemShutdown.describe(-1743))
+        denied.autoShutdown.lastResultAt = Date(); denied.autoShutdown.permission = .denied
+        denied.autoShutdown.phase = .waiting(remaining: 600)
+
+        var off = all; off.autoShutdown.enabled = false; off.autoShutdown.phase = .off
+        off.brightness = BrightnessInfo(supported: false, value: nil, method: "nicht verfügbar")
+
         let states: [(String, Facts)] = [("1-alles-ok", all), ("2-monitor-laeuft", running), ("3-kein-signal", waiting),
                                          ("4-software-dekodierung", software), ("5-macbook-nicht-erreichbar", unreachable),
                                          ("6-erster-start", firstRun), ("7-kein-kabel", noCable), ("8-bildfehler", failing),
-                                         ("9-alte-installation", legacy)]
+                                         ("9-alte-installation", legacy), ("12-ausschalten-countdown", countdown),
+                                         ("13-ausschalten-blockiert", denied), ("14-ausschalten-aus", off)]
         for (name, f) in states {
             let model = AppModel(preview: f)
             write(AnyView(ChecklistView(model: model)), to: dir.appendingPathComponent("\(name).png"))
         }
         let m = AppModel(preview: all)
         write(AnyView(UninstallSheet(model: m).background(Color(nsColor: .windowBackgroundColor))), to: dir.appendingPathComponent("10-deinstallieren.png"))
-        renderIdle(to: dir.appendingPathComponent("11-ruhebild-2048x1152pt.png"))
+        renderIdleStates(to: dir)
+        renderPanel(to: dir.appendingPathComponent("17-countdown-fenster.png"))
     }
 
-    /// Ruhebild des Players in iMac-Größe (2048×1152 pt, @2x)
-    private static func renderIdle(to url: URL) {
-        let size = NSSize(width: 2048, height: 1152)
-        let v = PlayerRootView(frame: NSRect(origin: .zero, size: size), videoLayer: CALayer(), hideCursor: false)
-        v.setIdleSubtitle("Warte auf MacBook \(Config.hostIP) …")
-        v.shiftIdleText(animated: false)
-        let win = NSWindow(contentRect: v.frame, styleMask: [.borderless], backing: .buffered, defer: false)
-        win.contentView = v
+    /// Ruhebild des Players in iMac-Größe (2048×1152 pt @2x = 4096×2304 px) in allen Zuständen.
+    /// Prüft jeden QR-Code mit CIDetector (muss genau Config.projectURL ergeben) und dass seine Module scharf sind
+    /// (nur Schwarz/Weiß, keine Zwischentöne). Rückgabe: alles in Ordnung.
+    @discardableResult
+    static func renderIdleStates(to dir: URL) -> Bool {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        struct S { var name: String; var heading: String; var context: String; var shift = CGPoint.zero; var countdown: Int? = nil }
+        let list = [
+            S(name: "11-ruhebild-macbook-nicht-erreichbar", heading: "Jetzt verbinden", context: PlayerController.unreachableHint),
+            S(name: "11-ruhebild-bereitschaft", heading: "Jetzt verbinden", context: PlayerController.standbyHint),
+            S(name: "11-ruhebild-verbunden-warte-auf-bild", heading: "Verbunden", context: "Das Bild kommt gleich …"),
+            S(name: "11-ruhebild-bildfehler", heading: "Bild kann nicht angezeigt werden",
+              context: "Dekodierfehler: Vorgang konnte nicht abgeschlossen werden (-12909) – neuer Versuch …"),
+            S(name: "11-ruhebild-bereitschaft-versetzt", heading: "Jetzt verbinden", context: PlayerController.standbyHint,
+              shift: CGPoint(x: 0.85, y: -0.9)),
+            S(name: "16-ruhebild-countdown", heading: "Jetzt verbinden", context: PlayerController.standbyHint, countdown: 42),
+        ]
+        var allOK = true
+        for st in list {
+            let size = NSSize(width: 2048, height: 1152)
+            let v = PlayerRootView(frame: NSRect(origin: .zero, size: size), videoLayer: CALayer(), hideCursor: false)
+            v.scaleOverride = 2
+            let win = NSWindow(contentRect: v.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            win.contentView = v
+            v.setIdleText(heading: st.heading, context: st.context)
+            v.setShift(st.shift)
+            if let c = st.countdown { v.setCountdown(remaining: c, fraction: Double(c) / 60) }
+            v.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4096, pixelsHigh: 2304, bitsPerSample: 8,
+                                             samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                             bytesPerRow: 0, bitsPerPixel: 0) else { allOK = false; continue }
+            rep.size = size
+            v.cacheDisplay(in: v.bounds, to: rep)
+            let url = dir.appendingPathComponent("\(st.name)-4096x2304.png")
+            if let png = rep.representation(using: .png, properties: [:]) { try? png.write(to: url) }
+            var line = "geschrieben: \(url.path) (\(rep.pixelsWide)×\(rep.pixelsHigh) px)"
+            if st.countdown == nil, let cg = rep.cgImage {
+                let found = QRCode.decode(cg)
+                let good = found == [Config.projectURL]
+                let q = v.qrFrame
+                let grays = intermediatePixels(rep, in: q)
+                line += " – QR \(Int(q.width))×\(Int(q.height)) pt (\(Int(q.width * 2)) px, \((q.width * 2) / CGFloat(QRCode.make(Config.projectURL)?.modules ?? 1)) px/Modul) "
+                    + "gelesen: \(found.isEmpty ? "NICHTS" : found.joined(separator: ", ")) \(good ? "OK" : "FEHLER"), Zwischentöne im Code: \(grays)"
+                if !good || grays > 0 { allOK = false }
+            } else if st.countdown != nil {
+                line += " – Countdown: „\(v.countdownText)“"
+            }
+            print(line)
+        }
+        print(allOK ? "QR-PRÜFUNG OK" : "QR-PRÜFUNG FEHLGESCHLAGEN")
+        return allOK
+    }
+
+    /// Pixel im QR-Feld (ohne die abgerundeten Ecken), die weder schwarz noch weiß sind
+    private static func intermediatePixels(_ rep: NSBitmapImageRep, in r: NSRect) -> Int {
+        let s = CGFloat(rep.pixelsWide) / rep.size.width
+        let x0 = Int((r.minX * s).rounded()), x1 = Int((r.maxX * s).rounded())
+        let yTop0 = Int(((rep.size.height - r.maxY) * s).rounded()), yTop1 = Int(((rep.size.height - r.minY) * s).rounded())
+        let corner = Int(r.width * s / 10)
+        var n = 0
+        for y in yTop0..<yTop1 {
+            for x in x0..<x1 {
+                let inCorner = (x - x0 < corner || x1 - x <= corner) && (y - yTop0 < corner || yTop1 - y <= corner)
+                if inCorner { continue }
+                guard let c = rep.colorAt(x: x, y: y) else { continue }
+                let w = c.brightnessComponent
+                if w > 0.03 && w < 0.97 { n += 1 }
+            }
+        }
+        return n
+    }
+
+    /// Schwebendes Countdown-Fenster (Monitor-Modus aus)
+    private static func renderPanel(to url: URL) {
+        let p = CountdownPanel {}
+        p.update(remaining: 42, fraction: 0.7)
+        guard let v = p.contentView else { return }
         v.layoutSubtreeIfNeeded()
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         guard let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
         v.cacheDisplay(in: v.bounds, to: rep)
         if let png = rep.representation(using: .png, properties: [:]) {
             try? png.write(to: url)
-            print("geschrieben: \(url.path) (\(rep.pixelsWide)x\(rep.pixelsHigh) px, Versatz \(Int(v.idleOffset.x)),\(Int(v.idleOffset.y)) pt)")
+            print("geschrieben: \(url.path) (\(rep.pixelsWide)x\(rep.pixelsHigh) px) – „\(p.text)“")
         }
     }
 

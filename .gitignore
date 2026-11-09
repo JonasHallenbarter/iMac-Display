@@ -1,0 +1,12 @@
+# Build-Ausgaben
+.build/
+Receiver/.build/
+dist/
+*.xcodeproj/xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Private Dateien / Backups
+*.zip

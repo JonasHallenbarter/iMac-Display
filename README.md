@@ -1,104 +1,157 @@
-# iMac Display – iMac 4K als externer Bildschirm für das MacBook
+# iMac Display
 
-Der iMac 4K (21,5", 4096×2304, macOS Monterey) wird über ein **direktes Ethernet-Kabel** zum zweiten Bildschirm
-des MacBooks. Das funktioniert unabhängig vom WLAN, in dem das MacBook gerade ist.
+**Machen Sie aus einem alten iMac einen 4K-Bildschirm für Ihr MacBook – per Netzwerkkabel, kostenlos und ohne Cloud.**
 
-## So funktioniert es
+<p align="center">
+  <img src="docs/images/sender-bereit.png" alt="iMac Display auf dem MacBook mit dem grünen Verbinden-Knopf" width="420">
+  &nbsp;&nbsp;
+  <img src="docs/images/empfaenger-leerlauf.png" alt="Der iMac wartet auf das MacBook" width="520">
+</p>
 
-```
-MacBook: „iMac Display“ (Menüleiste)                        iMac: „iMac Display Empfänger“
- 1. virtueller Bildschirm 2048×1152 pt (= 4096×2304 px)      5. eigener Vollbild-Player (kein Browser)
- 2. Bildschirmaufnahme (ScreenCaptureKit)                     6. H.264-Hardware-Dekodierung (VideoToolbox)
- 3. H.264-Hardware-Encoder (VideoToolbox)                     7. Bild 1:1 pixelgenau
- 4. Server :8080 ──── Ethernet-Kabel 10.77.0.1 ⇄ 10.77.0.2 ────
-```
+---
 
-- Das MacBook legt den virtuellen Bildschirm **nur an, solange der iMac verbunden ist**. 10 s nach dem Trennen
-  verschwindet er wieder, ohne Kabel bleibt kein „Geister-Bildschirm“ zurück.
-- Der iMac zeigt **„Aktuell kein aktiver Monitor“**, solange nichts übertragen wird. Das Bild startet von selbst,
-  sobald das MacBook sendet.
-- Die Verbindung läuft nur über das Kabel. Feste Adressen ohne Router sorgen dafür, dass das WLAN weiter für das
-  Internet zuständig bleibt. Der Server nimmt nur Verbindungen von 10.77.0.x, 169.254.x.x und dem MacBook selbst an.
-  Im Café-WLAN kann also niemand den Bildschirm sehen.
+## ⬇️ Download
 
-## Installation
+| | Für welches Gerät? | Download |
+|---|---|---|
+| **Empfänger** | Der Mac, der zum Bildschirm wird: **iMac oder anderer älterer Mac** | [![Empfänger herunterladen](https://img.shields.io/badge/Download-Empf%C3%A4nger%20(iMac%20%2F%20alter%20Mac)-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/JonasHallenbarter/iMac-Display/raw/main/Download/iMac-Display-Empfaenger.dmg) |
+| **Sender** | Der Mac, dessen Bild gezeigt wird: **MacBook** | [![Sender herunterladen](https://img.shields.io/badge/Download-Sender%20(MacBook)-0a84ff?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/JonasHallenbarter/iMac-Display/raw/main/Download/iMac-Display-Sender-MacBook.dmg) |
 
-Du brauchst zwei Dateien aus `dist/`:
+Direkte Links: [iMac-Display-Empfaenger.dmg](https://github.com/JonasHallenbarter/iMac-Display/raw/main/Download/iMac-Display-Empfaenger.dmg) · [iMac-Display-Sender-MacBook.dmg](https://github.com/JonasHallenbarter/iMac-Display/raw/main/Download/iMac-Display-Sender-MacBook.dmg)
 
-| Datei | Für |
+---
+
+## ✨ Das Wichtigste in Kürze
+
+- 🖥️ **4K-Qualität und geringe Latenz:** 4096 × 2304 Pixel, pixelgenau. Kodieren und Dekodieren läuft in der Grafik-Hardware.
+- 🔌 **Direkt per Netzwerkkabel:** Es funktioniert unabhängig vom WLAN und ohne Internet.
+- 🔒 **Alle Daten bleiben auf Ihren Geräten:** Es ist kein Server und kein Konto nötig.
+- 🕵️ **Wir erfassen keine Daten:** Das Projekt ist zu 100 % Open Source.
+- 💚 **100 % kostenlos:** Es gibt keine versteckten Premium-Funktionen. Es freut uns, wenn Sie einen alten Mac wiederverwenden können.
+- 📡 **Auch für Macs ohne AirPlay:** „AirPlay zum Mac“ gibt es nur auf neueren Modellen (etwa iMac ab 2019). iMac Display läuft auch auf älteren Macs wie dem iMac 4K von 2015 oder 2017.
+- 🔁 **Einmal verbinden, danach automatisch:** Wird das Kabel getrennt und wieder eingesteckt, verbindet es sich von selbst wieder.
+- ☀️ **Helligkeit des iMac** lässt sich bequem am MacBook einstellen.
+- 🌙 **Automatisch aus:** Kommt 10 Minuten lang kein Bild, schaltet sich der iMac aus (mit Countdown, abschaltbar).
+
+> **Hinweis:** Dieses Projekt wurde mit **Claude Code (Opus 5.5)** umgesetzt. Es gibt **keine Gewähr auf die Code-Qualität**.
+
+---
+
+## ✅ Voraussetzungen
+
+| | Sender (MacBook) | Empfänger (iMac / alter Mac) |
+|---|---|---|
+| **Gerät** | Mac mit Apple-Chip (M1 oder neuer) | Jeder Mac mit Intel- oder Apple-Chip, ideal ein iMac mit 4K- oder 5K-Bildschirm |
+| **System** | macOS 13 Ventura oder neuer | macOS 12 Monterey oder neuer |
+| **Anschluss** | Ethernet (USB-C-/Thunderbolt-Adapter geht) | Ethernet |
+
+Dazu brauchen Sie ein **normales Netzwerkkabel** (Cat 5e oder besser), das direkt von Mac zu Mac führt. Ein Router ist nicht nötig.
+
+**Unterstützt:** macOS-Geräte. Eine Version für Linux oder Windows gibt es aktuell nicht.
+
+---
+
+## 🚀 So einfach geht's
+
+### 1. Empfänger auf dem iMac installieren
+
+1. Laden Sie **`iMac-Display-Empfaenger.dmg`** herunter (oben) und öffnen Sie die Datei.
+2. Ziehen Sie **„iMac Display Empfänger“** in den Ordner **Programme**.
+3. Beim **ersten Start** klicken Sie die App mit der **rechten Maustaste** an und wählen **Öffnen** und dann noch einmal **Öffnen** (siehe [Warum warnt macOS?](#-warum-warnt-macos-beim-ersten-öffnen)).
+4. Im Fenster arbeiten Sie die Liste von oben nach unten ab. Jede Zeile wird grün, sobald alles passt:
+   - **Netzwerkadresse → Einrichten** (fragt nach Ihrem Passwort)
+   - **Autostart einschalten**
+   - **Monitor-Modus starten**
+
+### 2. Sender auf dem MacBook installieren
+
+1. Laden Sie **`iMac-Display-Sender-MacBook.dmg`** herunter (oben) und öffnen Sie die Datei.
+2. Ziehen Sie **„iMac Display“** in den Ordner **Programme** und starten Sie die App. Oben in der Menüleiste erscheint ein Bildschirm-Symbol.
+3. Im Fenster **„Einrichtung & Status“**:
+   - **Bildschirmaufnahme → Erlauben …**: Schalten Sie in den Systemeinstellungen „iMac Display“ ein und klicken Sie danach auf **Neu starten**.
+   - **Netzwerkadresse → Einrichten** (fragt nach Ihrem Passwort)
+
+### 3. Verbinden
+
+Stecken Sie das Netzwerkkabel ein. Sobald der iMac bereit ist, leuchtet auf dem MacBook der große grüne Knopf auf. Klicken Sie auf **VERBINDEN**, und schon zeigt der iMac Ihren zweiten Bildschirm. 🎉
+
+<p align="center">
+  <img src="docs/images/sender-verbunden.png" alt="Verbunden" width="420">
+</p>
+
+Ab jetzt verbindet sich alles automatisch, sobald das Kabel steckt. Den Bildschirm anordnen können Sie unter *Systemeinstellungen → Displays*.
+
+---
+
+## 🔐 Datenschutz
+
+- **Wir erfassen keine Daten.** Es gibt keine Analyse, keine Werbung, kein Konto und keine Verbindung ins Internet.
+- **Beide Programme laufen lokal:** Der Empfänger läuft auf dem iMac, der Sender auf dem MacBook. Das Bild geht direkt über das Kabel von einem Gerät zum anderen.
+- **Nur über das Kabel erreichbar:** Der Sender nimmt nur Verbindungen über die direkte Kabelverbindung an. Im WLAN, etwa im Café, kann niemand Ihren Bildschirm sehen.
+- **Alles nachprüfbar:** Der gesamte Quellcode liegt hier offen.
+
+---
+
+## 🛡️ Sicher und jederzeit rückgängig zu machen
+
+Beide Apps ändern nur etwas, wenn Sie auf einen Knopf klicken, und alles lässt sich im Fenster wieder rückgängig machen:
+
+| Was | So machen Sie es rückgängig |
 |---|---|
-| `iMac-Display-MacBook.dmg` | MacBook |
-| `iMac-Display-Empfaenger.dmg` | iMac (Universal: Intel + Apple Silicon, ab macOS 12) |
+| Feste Netzwerkadresse | **Zurücksetzen** stellt Ihre vorherige Einstellung exakt wieder her |
+| Bildschirmaufnahme (MacBook) | **Entziehen** |
+| Start bei Anmeldung / Autostart | Schalter aus |
+| Automatisch wiederverbinden | **Trennen** |
+| Automatisch ausschalten (iMac) | Schalter aus |
+| Alles entfernen | **Deinstallieren …**: Sie können jeden Teil einzeln wählen, die App landet im Papierkorb |
 
-### MacBook
+---
 
-1. DMG öffnen, **iMac Display** in „Programme“ ziehen und starten. Ein Bildschirm-Symbol erscheint in der Menüleiste.
-2. Das Fenster **„Einrichtung & Status“** öffnet sich. Jede Zeile hat eine Ampel. Ist sie nicht grün, steht darunter
-   „Was tun?“ mit einem passenden Knopf:
-   - **Bildschirmaufnahme → Erlauben …**: Schalter bei „iMac Display“ einschalten, danach „Neu starten“.
-   - **Netzwerkadresse 10.77.0.1 → Einrichten**: gibt nur dem Kabel-Adapter die feste Adresse, ohne Router.
-     macOS fragt nach dem Admin-Passwort. Die vorherige Einstellung wird gespeichert, **Zurücksetzen** stellt sie
-     exakt wieder her.
-3. Optional: **Bei Anmeldung starten** einschalten.
+## ❓ Häufige Fragen
 
-### iMac
+### 🍏 Warum warnt macOS beim ersten Öffnen?
+Die Apps sind kostenlos und nicht bei Apple gegen Gebühr notarisiert. macOS fragt deshalb einmal nach:
+- **macOS 12 bis 14:** Rechtsklick auf die App → **Öffnen** → **Öffnen**.
+- **macOS 15 und neuer:** Öffnen Sie die App einmal per Doppelklick und schließen Sie die Meldung. Gehen Sie dann zu *Systemeinstellungen → Datenschutz & Sicherheit*, scrollen Sie nach unten und klicken Sie auf **Dennoch öffnen**.
 
-1. DMG auf den iMac kopieren (AirDrop/USB-Stick) und öffnen, **iMac Display Empfänger** in „Programme“ ziehen.
-2. Beim ersten Start: **Rechtsklick → Öffnen** (die App ist nicht von Apple notarisiert).
-3. Im Fenster **Netzwerkadresse 10.77.0.2 → Einrichten** und **Autostart einschalten**. Dann
-   **Monitor-Modus starten**: Das Bild erscheint im Vollbild, danach ist nichts anderes mehr zu sehen.
-   Ein Browser ist nicht nötig.
-4. Empfehlung: automatische Anmeldung auf dem iMac aktivieren (*Systemeinstellungen → Benutzer:innen & Gruppen →
-   Anmeldeoptionen*), dann startet nach dem Einschalten direkt der Monitor.
+Danach startet die App ganz normal.
 
-**Beenden:** Cmd+Q im Vollbild. Danach erscheint wieder das Statusfenster. Stürzt die App ab, startet der Autostart sie neu.
+### Der grüne Knopf leuchtet nicht.
+Schauen Sie im Fenster auf dem MacBook nach: Die rote oder orange Zeile zeigt unter **„Was tun?“**, woran es liegt, zum Beispiel am Kabel, an der Netzwerkadresse oder daran, dass die iMac-App nicht gestartet ist.
 
-### Danach
+### Das Bild ruckelt.
+Drücken Sie auf dem iMac im Vollbild die Taste **`s`**. Dann sehen Sie Bildrate, Datenrate und Fehler. Die Zeile **„Video-Dekodierung“** im Fenster des Empfängers zeigt, ob der Mac 4K in der Hardware dekodieren kann.
 
-Kabel einstecken, fertig. Das MacBook erkennt den iMac, legt den Bildschirm an, und der iMac zeigt das Bild.
-Anordnen kannst du ihn unter *Systemeinstellungen → Displays*.
-Menüleiste → **Testbild auf iMac anzeigen** zeigt ein Schärfe- und Bewegungstestbild auf dem iMac.
+### Wie beende ich den Vollbildmodus auf dem iMac?
+Mit **Cmd + Q**. Danach erscheint wieder das Statusfenster.
 
-## Abschalten und Entfernen
+### Die Helligkeit springt zurück.
+Schalten Sie auf dem iMac *Systemeinstellungen → Monitore → Helligkeit automatisch anpassen* aus.
 
-Beide Apps greifen nur auf Knopfdruck ins System ein, und jede Änderung lässt sich im Fenster rückgängig machen.
+Ausführliche Anleitung und weitere Lösungen: [docs/ANLEITUNG.md](docs/ANLEITUNG.md)
 
-| Was | Abschalten / Rückgängig |
-|---|---|
-| Übertragung (MacBook) | Schalter **Übertragung aktiv** (auch im Menü) |
-| Bildschirmaufnahme | **Entziehen** |
-| Feste Netzwerkadresse | **Zurücksetzen** (stellt die gespeicherte vorherige Einstellung her) |
-| Start bei Anmeldung / Autostart | Schalter bzw. **Autostart ausschalten** |
-| Alles | **Deinstallieren …**: Haken für jeden Teil, die App wandert in den Papierkorb |
+---
 
-Notfall, falls die MacBook-App nicht mehr startet: `scripts/macbook/uninstall.command`.
-
-## Fehlerbehebung
-
-Fast alles zeigen die Statusfenster direkt an, rote Zeile mit „Was tun?“. Zusätzlich:
-
-- **Bild ruckelt:** Auf dem iMac im Vollbild `s` drücken: Statistik mit fps, Mbit/s und Fehlern. Im Statusfenster zeigt
-  „Video-Dekodierung“, ob der iMac 4K per Hardware dekodiert. Sonst die Bildrate senken:
-  `defaults write de.local.imac-display fps -int 30`, dann die App neu starten.
-- **Bildschirmaufnahme ist erlaubt, geht aber nicht** (nach einem Update der App): im Fenster
-  **Eintrag zurücksetzen**, dann erneut erlauben. Jede neue Version gilt für macOS als neue App.
-- **iMac zeigt dauerhaft „Aktuell kein aktiver Monitor“:** Im MacBook-Fenster die Zeilen „Ethernet-Kabel“,
-  „Netzwerkadresse“ und „iMac erreichbar“ prüfen. Ab macOS 15 gegebenenfalls *Lokales Netzwerk* für „iMac Display“ erlauben.
-- **Protokolle:** MacBook `~/Library/Logs/iMacDisplay.log`, iMac über „Protokoll anzeigen“ im Fenster.
-
-## Für Entwickler
+## 🛠️ Für Entwickler
 
 ```
-Sources/imac-display/      MacBook-App (Swift): AppController, VirtualDisplay, ScreenCapture, H264Encoder,
-                           SPSRewriter, StreamServer, Setup*, QualityLab; Resources/index.html = Browser-Player
-                           (für Tests unter http://127.0.0.1:8080/)
-Receiver/                  iMac-App (Swift, macOS 12, universal) mit eigenem Player (AVSampleBufferDisplayLayer)
-scripts/macbook/           build-app.sh (App + DMG), install.command, uninstall.command, run.sh
-scripts/make-imac-package.sh → Receiver/build-dmg.sh
-docs/PROTOCOL.md           Wire-Protokoll und Architektur
+Sources/imac-display/   Sender (Swift): virtueller Bildschirm, ScreenCaptureKit, H.264 (VideoToolbox), WebSocket-Server, Einrichtungsfenster
+Receiver/               Empfänger (Swift, macOS 12, Universal): eigener Vollbild-Player, Einrichtung, Autostart
+scripts/macbook/        build-app.sh – baut den Sender und die DMG
+docs/PROTOCOL.md        Architektur und Übertragungsprotokoll
 ```
 
-- Bauen: `scripts/macbook/build-app.sh` und `Receiver/build-dmg.sh`
-- Testen ohne Bildschirmaufnahme: `imac-display --test-pattern`, dann im Browser `http://127.0.0.1:8080/` öffnen
-- Qualitätsmessung: `imac-display --selftest-quality`
-- Kommandozeile: `imac-display --help`. Wichtige Optionen sind `--fps`, `--bitrate`, `--always-on`, `--demo-window`, `--dry-run`.
+Selbst bauen (Xcode oder Command Line Tools):
+
+```bash
+scripts/macbook/build-app.sh      # Sender  → dist/iMac-Display-MacBook.dmg
+Receiver/build-dmg.sh             # Empfänger → dist/iMac-Display-Empfaenger.dmg
+```
+
+Testen ohne Bildschirmaufnahme: `imac-display --test-pattern`, dann `http://127.0.0.1:8080/` im Browser öffnen. Alle Optionen zeigt `imac-display --help`.
+
+---
+
+## 📄 Lizenz
+
+[MIT](LICENSE): frei nutzbar, veränderbar und weitergebbar, ohne Gewähr.

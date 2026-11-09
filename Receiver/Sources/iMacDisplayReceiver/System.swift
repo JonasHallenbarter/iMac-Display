@@ -362,27 +362,35 @@ enum Autostart {
 ///   • Monitor-Modus an + MacBook erreichbar: Bildschirm bleibt an; beim Übergang „nicht erreichbar → erreichbar“
 ///                                          wird der Bildschirm einmal aufgeweckt (wie `caffeinate -u`).
 ///   • MacBook weg / Monitor-Modus aus:     alles wieder freigegeben → normaler Ruhezustand.
+///   • „Automatisch ausschalten“ an:         Rechner schläft nicht automatisch ein, damit er nach 10 Min. ohne Bild
+///                                          wirklich ausschaltet (nach einem fehlgeschlagenen Versuch nicht mehr).
+///   • Countdown vor dem Ausschalten:        Bildschirm einmal aufwecken und wach halten, damit man ihn sieht.
 final class PowerController {
     private var displayID: IOPMAssertionID = 0      // PreventUserIdleDisplaySleep
     private var systemID: IOPMAssertionID = 0       // PreventUserIdleSystemSleep
     private var activityID: IOPMAssertionID = 0     // DeclareUserActivity (eine ID, wird wiederverwendet)
+    private var countdownID: IOPMAssertionID = 0    // PreventUserIdleDisplaySleep während des Countdowns
+    private var countdownActivityID: IOPMAssertionID = 0
     private var wanted = false
 
     var displayHeld: Bool { displayID != 0 }
     var systemHeld: Bool { systemID != 0 }
     var activityHeld: Bool { activityID != 0 }
     /// Für Tests/Protokoll: Anzahl gehaltener Assertions
-    var heldCount: Int { [displayID, systemID, activityID].filter { $0 != 0 }.count }
+    var countdownHeld: Bool { countdownID != 0 }
+    var heldCount: Int { [displayID, systemID, activityID, countdownID].filter { $0 != 0 }.count }
 
-    func update(reachable: Bool, active: Bool) {
-        // 1. Rechner wach, solange der Monitor-Modus läuft
-        if active && systemID == 0 {
+    func update(reachable: Bool, active: Bool, shutdownTimer: Bool = false) {
+        // 1. Rechner wach, solange der Monitor-Modus läuft bzw. „Automatisch ausschalten“ wartet
+        let keepAwake = active || shutdownTimer
+        if keepAwake && systemID == 0 {
+            let why = active ? "wartet auf das MacBook" : "schaltet nach 10 Min. ohne Bild aus"
             let r = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
                                                 IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                                                "iMac Display: wartet auf das MacBook" as CFString, &systemID)
+                                                "iMac Display: \(why)" as CFString, &systemID)
             if r != kIOReturnSuccess { systemID = 0 }
-            Log.write("Ruhezustand des Rechners aufgeschoben (Monitor-Modus) – \(r == kIOReturnSuccess ? "ok" : "Fehler \(r)")")
-        } else if !active && systemID != 0 {
+            Log.write("Ruhezustand des Rechners aufgeschoben (\(active ? "Monitor-Modus" : "automatisch ausschalten")) – \(r == kIOReturnSuccess ? "ok" : "Fehler \(r)")")
+        } else if !keepAwake && systemID != 0 {
             IOPMAssertionRelease(systemID); systemID = 0
             Log.write("Rechner darf wieder normal in den Ruhezustand")
         }
@@ -412,6 +420,24 @@ final class PowerController {
         wanted = want
     }
 
-    func releaseAll() { update(reachable: false, active: false) }
+    /// Countdown „Automatisch ausschalten“: Bildschirm aufwecken (wie `caffeinate -u`; zählt nicht als Eingabe) und wach halten
+    func setCountdown(_ on: Bool) {
+        if on && countdownID == 0 {
+            let a = IOPMAssertionDeclareUserActivity("iMac Display: Countdown vor dem Ausschalten" as CFString, kIOPMUserActiveLocal, &countdownActivityID)
+            if a != kIOReturnSuccess { countdownActivityID = 0 }
+            let r = IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                                                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                                "iMac Display: Countdown vor dem Ausschalten" as CFString, &countdownID)
+            if r != kIOReturnSuccess { countdownID = 0 }
+        } else if !on {
+            if countdownActivityID != 0 { IOPMAssertionRelease(countdownActivityID); countdownActivityID = 0 }
+            if countdownID != 0 { IOPMAssertionRelease(countdownID); countdownID = 0 }
+        }
+    }
+
+    func releaseAll() {
+        setCountdown(false)
+        update(reachable: false, active: false, shutdownTimer: false)
+    }
     deinit { releaseAll() }
 }

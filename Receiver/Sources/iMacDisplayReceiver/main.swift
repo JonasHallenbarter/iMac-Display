@@ -9,13 +9,19 @@ import Foundation
 //   --host <ip:port>          anderes Ziel statt 10.77.0.1:8080 (auch IMAC_RECEIVER_HOST)
 //   --probe-decoder           Probedekodierung 4096×2304 ausgeben
 //   --print-status            Checkliste als Text ausgeben
-//   --render-preview <Ordner> Vorschaubilder der Checkliste als PNG
+//   --render-preview <Ordner> Vorschaubilder der Checkliste, des Ruhebilds (4096×2304) und des Countdowns als PNG
+//   --shutdown-guard          nur ausgeben, ob „Automatisch ausschalten“ hier wirklich ausschalten würde (sendet nichts)
+//   --test-qr <Ordner>        nur die Ruhebilder rendern und jeden QR-Code mit CIDetector prüfen (Exit 1 bei Fehler)
 //   --autostart on|off|status LaunchAgent schreiben/entfernen (respektiert IMAC_RECEIVER_HOME/_LAUNCHCTL)
 //   --network setup|reset     Netzwerk-Aktion (nur mit IMAC_RECEIVER_DRY_RUN=1)
 //   --uninstall               alle Deinstallations-Schritte (nur mit IMAC_RECEIVER_DRY_RUN=1)
 // Test-Umgebung (siehe TestHooks.swift / Player.swift): IMAC_RECEIVER_WINDOW=WxH (Fenster statt Vollbild),
 //   IMAC_RECEIVER_SCREEN=n, IMAC_RECEIVER_RENDERER=vt, IMAC_RECEIVER_TEST_STATS=<datei>, IMAC_RECEIVER_TEST_VERIFY=1,
-//   IMAC_RECEIVER_TEST_CORRUPT=n
+//   IMAC_RECEIVER_TEST_CORRUPT=n, IMAC_RECEIVER_TEST_BRIGHTNESS=log (Helligkeit nur protokollieren)
+// Automatisch ausschalten (AutoShutdown.swift): IMAC_RECEIVER_SHUTDOWN_IDLE=<s> (Standard 600),
+//   IMAC_RECEIVER_SHUTDOWN_COUNTDOWN=<s> (Standard 60), IMAC_RECEIVER_AUTO_SHUTDOWN=0|1 (Startwert, nicht gespeichert),
+//   IMAC_RECEIVER_FAKE_INPUT_IDLE=<s> (nur Testmodus), IMAC_RECEIVER_NO_SHUTDOWN=1 (nie wirklich ausschalten).
+//   Wirklich ausgeschaltet wird NIE im Testmodus, im Testfenster oder wenn das Programm nicht als .app läuft.
 
 setvbuf(stdout, nil, _IOLBF, 0)
 let args = Array(CommandLine.arguments.dropFirst())
@@ -47,7 +53,11 @@ func currentFactsWithReach() -> Facts {
 
 if args.contains("--print-status") {
     DecoderProbe.runNow()
-    print(Checks.text(Checks.build(currentFactsWithReach())))
+    var f = currentFactsWithReach()
+    f.brightness = BrightnessInfo.current()
+    f.autoShutdown.enabled = AutoShutdown().enabled
+    f.autoShutdown.phase = f.autoShutdown.enabled ? .waiting(remaining: Config.shutdownIdle) : .off
+    print(Checks.text(Checks.build(f)))
     exit(0)
 }
 if args.contains("--probe-decoder") {
@@ -80,6 +90,16 @@ if args.contains("--uninstall") {
     m.refresh(quick: true)
     m.runUninstall(UninstallOptions())
     exit(0)
+}
+if args.contains("--shutdown-guard") {
+    // Nur Auskunft (sendet nie etwas): würde dieser Prozess wirklich ausschalten?
+    print(SystemShutdown.blockReason.map { "blockiert: \($0)" } ?? "würde wirklich ausschalten (kein Testmodus, läuft als App)")
+    exit(0)
+}
+if let dir = argValue("--test-qr") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    exit(PreviewRenderer.renderIdleStates(to: URL(fileURLWithPath: dir)) ? 0 : 1)
 }
 if let dir = argValue("--render-preview") {
     let app = NSApplication.shared

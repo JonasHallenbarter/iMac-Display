@@ -23,6 +23,49 @@ struct AppStatus {
     var testPattern = false
     var loginStatus: SMAppService.Status = .notRegistered
     var dryRun = false
+    // Connection intent (docs/PROTOCOL.md "Erweiterung v2")
+    var phase: ConnectionPhase = .unavailable
+    var connectWanted = false
+    /// Why "connecting" does not progress (e.g. Screen Recording not allowed); nil = all fine.
+    var connectProblem: String?
+    // iMac brightness as reported by the receiver: nil = not reported (yet).
+    var brightnessSupported: Bool?
+    var brightnessValue: Double?
+    var receiverVersion: String?
+}
+
+/// Connection state of the MacBook app (docs/PROTOCOL.md v2).
+enum ConnectionPhase: String {
+    /// Main switch "Übertragung aktiv" is off – server stopped.
+    case off
+    /// No iMac client connected (and no wish to connect) or the server does not run.
+    case unavailable
+    /// iMac client connected, intent off → standby, no virtual display. The big button lights up.
+    case ready
+    /// Intent on + iMac connected: virtual display is being created / waiting for the first frame.
+    case connecting
+    /// Streaming.
+    case connected
+    /// Intent on, no iMac client → reconnects automatically as soon as the iMac is back.
+    case waitingForIMac
+}
+
+/// What the big button at the top of the setup window shows.
+struct ConnectButtonInfo: Equatable {
+    enum Style: Equatable { case ready, connecting, connected, waiting, unavailable, off, blocked }
+    var style: Style
+    /// Text inside the circle.
+    var title: String
+    /// Optional SF Symbol above the title.
+    var symbol: String?
+    /// Line under the button.
+    var caption: String?
+    /// Smaller second line under the button.
+    var detail: String?
+    /// The circle itself is clickable (only "Verbinden").
+    var enabled: Bool
+    var showDisconnect = false
+    var showEnableTransmission = false
 }
 
 enum CheckState { case ok, warning, error, inactive, info }
@@ -69,6 +112,12 @@ protocol SetupActions: AnyObject {
     func setLoginItem(_ on: Bool)
     func showLog()
     func performUninstall(_ o: UninstallOptions)
+    /// Big button "Verbinden": intent on (persisted) → virtual display + stream.
+    func connect()
+    /// "Trennen": intent off → display removed, iMac shows its idle screen.
+    func disconnect()
+    /// iMac brightness 0…1. `final: false` while dragging (throttled), `true` on release / ± buttons.
+    func setBrightness(_ value: Double, final: Bool)
 }
 
 enum SettingsURL {
@@ -91,6 +140,8 @@ final class SetupModel: ObservableObject {
     @Published var networkBackups: [String] = []
     /// Last action result, shown under the header (e.g. "Dry-Run: networksetup …").
     @Published var message: String?
+    /// Setup window on screen and not fully covered: animations of the big button run only then.
+    @Published var windowVisible = true
 
     weak var actions: SetupActions?
     private var pingOKWithoutClientSince: Date?
@@ -131,9 +182,110 @@ final class SetupModel: ObservableObject {
         let r = rows
         if !app.transmissionEnabled { return (.inactive, "Übertragung ist ausgeschaltet") }
         if let e = r.first(where: { $0.state == .error }) { return (.error, "Problem: \(e.title)") }
-        if app.clients > 0 && (app.capturing || app.testPattern) { return (.ok, "Läuft – der iMac zeigt den virtuellen Bildschirm") }
+        switch app.phase {
+        case .connected: return (.ok, "Verbunden – der iMac zeigt den virtuellen Bildschirm")
+        case .ready: return (.ok, "Bereit – der iMac wartet, „Verbinden“ klicken")
+        case .connecting:
+            return app.connectProblem.map { (.warning, "Verbinden geht nicht: \($0)") } ?? (.ok, "Verbinde mit dem iMac …")
+        case .waitingForIMac: return (.ok, "Wartet auf den iMac – verbindet automatisch")
+        case .off, .unavailable: break
+        }
         if let w = r.first(where: { $0.state == .warning }) { return (.warning, "\(w.title): \(w.detail)") }
         return (.ok, "Bereit – wartet auf den iMac")
+    }
+
+    // MARK: - Big button
+
+    /// The most relevant reason why no iMac is connected (short, for the big button), derived from the checklist.
+    var unavailableCause: String {
+        if !app.transmissionEnabled { return "Übertragung ist ausgeschaltet" }
+        if app.serverError != nil { return "Übertragung startet nicht (Port \(app.port) belegt)" }
+        guard let p = probe else { return "Verbindung wird geprüft …" }
+        guard let c = p.chosen else { return "Kein Ethernet-Adapter gefunden" }
+        if !c.linkActive { return "Kabel nicht verbunden" }
+        if let def = p.defaultRouteInterface, def == c.device { return "Internet läuft über das Kabel" }
+        let configured = c.ipv4.contains(NetworkSetup.macIP) || p.chosenConfig?.isCableConfig == true
+        if !configured { return "Netzwerkadresse nicht eingerichtet" }
+        if p.firewallBlockAll == true { return "Firewall blockiert eingehende Verbindungen" }
+        if localNetworkSuspect { return "„Lokales Netzwerk“ nicht erlaubt" }
+        if p.pingOK == true { return "iMac-App nicht gestartet" }
+        if p.pingOK == false { return "iMac antwortet nicht" }
+        return "Wartet auf den iMac"
+    }
+
+    var button: ConnectButtonInfo { Self.buttonInfo(app: app, cause: unavailableCause) }
+
+    static func buttonInfo(app: AppStatus, cause: String) -> ConnectButtonInfo {
+        switch app.phase {
+        case .off:
+            return ConnectButtonInfo(style: .off, title: "Übertragung ist aus", symbol: "power",
+                                     caption: "Der iMac bekommt kein Bild",
+                                     detail: "Schalter „Übertragung aktiv“ einschalten", enabled: false,
+                                     showEnableTransmission: true)
+        case .unavailable:
+            let symbol = cause == "iMac-App nicht gestartet" ? "desktopcomputer" : "cable.connector.slash"
+            return ConnectButtonInfo(style: .unavailable, title: "Kein iMac", symbol: symbol,
+                                     caption: cause, detail: causeHint(cause), enabled: false)
+        case .ready:
+            return ConnectButtonInfo(style: .ready, title: "VERBINDEN", symbol: nil,
+                                     caption: "Der iMac ist bereit",
+                                     detail: "Klicken – der iMac wird zum zweiten Bildschirm", enabled: true)
+        case .connecting:
+            if let problem = app.connectProblem {
+                return ConnectButtonInfo(style: .blocked, title: "Geht nicht", symbol: "exclamationmark.triangle.fill",
+                                         caption: problem, detail: "Was tun? Siehe Liste unten",
+                                         enabled: false, showDisconnect: true)
+            }
+            return ConnectButtonInfo(style: .connecting, title: "VERBINDE …", symbol: nil,
+                                     caption: "Virtueller Bildschirm wird angelegt …", detail: nil,
+                                     enabled: false, showDisconnect: true)
+        case .connected:
+            var line = app.pixelSize
+            if app.testPattern { line += " · Testbild" }
+            line += app.fps >= 1 ? String(format: " · %.0f fps · %.0f Mbit/s", app.fps, app.mbit) : " · Bild unverändert"
+            return ConnectButtonInfo(style: .connected, title: "VERBUNDEN", symbol: "checkmark",
+                                     caption: line, detail: nil, enabled: false, showDisconnect: !app.testPattern)
+        case .waitingForIMac:
+            return ConnectButtonInfo(style: .waiting, title: "Wartet auf iMac", symbol: "arrow.triangle.2.circlepath",
+                                     caption: "Verbindet automatisch, sobald der iMac da ist",
+                                     detail: "Gerade: \(cause)", enabled: false, showDisconnect: true)
+        }
+    }
+
+    /// Short "what to do" for the most common causes (details in the checklist).
+    static func causeHint(_ cause: String) -> String {
+        switch cause {
+        case "Kabel nicht verbunden": return "Kabel an beiden Macs einstecken, iMac einschalten"
+        case "iMac-App nicht gestartet": return "Auf dem iMac „iMac Display Empfänger“ öffnen"
+        case "Netzwerkadresse nicht eingerichtet": return "Unten bei „Netzwerkadresse“ auf „Einrichten“ klicken"
+        case "Kein Ethernet-Adapter gefunden": return "USB-C-/Thunderbolt-Ethernet-Adapter anschließen"
+        case "iMac antwortet nicht": return "iMac eingeschaltet und angemeldet? Kabel am iMac fest?"
+        default: return "Hinweise in der Liste unten"
+        }
+    }
+
+    /// Exactly what a click on the big circle does.
+    func pressMainButton() {
+        guard button.enabled else { return }
+        actions?.connect()
+    }
+
+    /// Brightness steps for the −/+ buttons (1/16 ≈ 6.25 %).
+    static let brightnessStep = 1.0 / 16
+
+    func stepBrightness(_ direction: Int) {
+        let cur = app.brightnessValue ?? 0.5
+        let next = ((cur / Self.brightnessStep).rounded() + Double(direction)) * Self.brightnessStep
+        actions?.setBrightness(min(1, max(0, next)), final: true)
+    }
+
+    var brightnessEnabled: Bool { app.clients > 0 && app.brightnessSupported == true }
+
+    var brightnessHint: String? {
+        if brightnessEnabled { return nil }
+        if !app.transmissionEnabled || app.clients == 0 { return "Verfügbar, sobald der iMac verbunden ist." }
+        if app.brightnessSupported == false { return "Dieser iMac lässt sich vom Empfänger aus nicht dimmen." }
+        return "Der Empfänger auf dem iMac meldet keine Helligkeit – „iMac Display Empfänger“ aktualisieren."
     }
 
     // MARK: - Rows
@@ -297,6 +449,8 @@ final class SetupModel: ObservableObject {
         // f) iMac verbunden
         if app.clients > 0 {
             var d = "Verbunden" + (app.clientIP.map { " (\($0))" } ?? "") + (app.clients > 1 ? " – \(app.clients) Clients" : "")
+            if let v = app.receiverVersion { d += " · Empfänger \(v)" }
+            if app.phase == .ready { d += " · Bereitschaft – oben „Verbinden“ klicken" }
             if let s = app.clientStats {
                 var parts: [String] = []
                 if let f = s["fps"] as? NSNumber { parts.append(String(format: "%.0f fps", f.doubleValue)) }
@@ -326,9 +480,12 @@ final class SetupModel: ObservableObject {
                 detail: "Aktiv: \(app.pixelSize) Pixel (\(app.pointSize) Punkte)"
                     + (app.capturing ? String(format: " · %.0f fps · %.0f Mbit/s", app.fps, app.mbit) : " · Aufnahme startet …")))
         } else {
-            rows.append(CheckRow(id: "display", state: .inactive, title: "Virtueller Bildschirm",
-                                 detail: app.transmissionEnabled ? "Inaktiv – wird angelegt, sobald der iMac verbunden ist."
-                                    : "Inaktiv (Übertragung aus)."))
+            let detail: String
+            if !app.transmissionEnabled { detail = "Inaktiv (Übertragung aus)." }
+            else if app.connectWanted { detail = "Inaktiv – wird automatisch angelegt, sobald der iMac verbunden ist." }
+            else if app.clients > 0 { detail = "Inaktiv – wird angelegt, sobald du oben „Verbinden“ klickst." }
+            else { detail = "Inaktiv – „Verbinden“ geht, sobald der iMac verbunden ist." }
+            rows.append(CheckRow(id: "display", state: .inactive, title: "Virtueller Bildschirm", detail: detail))
         }
 
         // h) Lokales Netzwerk (macOS 15+), nur bei Verdacht

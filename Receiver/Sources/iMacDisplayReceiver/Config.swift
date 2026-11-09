@@ -7,6 +7,10 @@ enum Config {
     static let bundleID = "de.local.imac-display-receiver"
     static let agentLabel = "de.local.imac-display-receiver"
     static let appName = "iMac Display Empfänger"
+    /// App-Version (build-dmg.sh liest sie von hier für CFBundleShortVersionString)
+    static let version = "1.3"
+    /// Link für QR-Code und Ruhebild
+    static let projectURL = "https://github.com/JonasHallenbarter/iMac-Display"
 
     /// Ziel (MacBook-Server). Zum Testen: --host 127.0.0.1:18095 oder IMAC_RECEIVER_HOST
     static let host: String = {
@@ -24,6 +28,11 @@ enum Config {
 
     /// Testmodus: Netzwerk-Änderungen und „App in den Papierkorb“ werden nur protokolliert.
     static let dryRun = env["IMAC_RECEIVER_DRY_RUN"] == "1"
+
+    /// Automatisch ausschalten: so lange ohne Bild und ohne Eingabe (Sekunden), dann so lange Countdown.
+    /// Nur zum Testen verkürzbar: IMAC_RECEIVER_SHUTDOWN_IDLE=20, IMAC_RECEIVER_SHUTDOWN_COUNTDOWN=5
+    static let shutdownIdle: Double = max(5, Double(env["IMAC_RECEIVER_SHUTDOWN_IDLE"] ?? "") ?? 600)
+    static let shutdownCountdown: Double = max(3, Double(env["IMAC_RECEIVER_SHUTDOWN_COUNTDOWN"] ?? "") ?? 60)
 
     static let home: URL = URL(fileURLWithPath: env["IMAC_RECEIVER_HOME"] ?? NSHomeDirectory(), isDirectory: true)
     static var supportDir: URL { home.appendingPathComponent("Library/Application Support/iMacDisplay", isDirectory: true) }

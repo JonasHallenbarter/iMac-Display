@@ -3,7 +3,8 @@ import QuartzCore
 
 /// WebSocket-Client für ws://HOST/ws (URLSessionWebSocketTask, macOS 10.15+).
 /// Verbindet sich für immer neu (1 → 1,5 → 2 s), bricht nach 3 s ohne Verbindungsaufbau und nach 8 s ohne
-/// Nachricht ab (z. B. Kabel gezogen, MacBook eingefroren). Alle Ereignisse laufen auf `queue`.
+/// Nachricht ab (z. B. Kabel gezogen, MacBook eingefroren). Jede Nachricht zählt als Lebenszeichen – auch die
+/// Steuer-Nachrichten (0x03, Protokoll v2: der Server wiederholt `status` alle 2 s). Alle Ereignisse laufen auf `queue`.
 final class StreamClient: NSObject, URLSessionWebSocketDelegate {
     enum Event {
         case opened
@@ -11,6 +12,8 @@ final class StreamClient: NSObject, URLSessionWebSocketDelegate {
         case config(Data)
         /// `data[offset...]` = Annex B; receivedAt = CACurrentMediaTime()
         case video(Data, offset: Int, key: Bool, timestampUs: UInt64, receivedAt: Double)
+        /// 0x03 + JSON-Objekt mit "type" (v2: "status", "brightness"; unbekannte Typen ignoriert der Player)
+        case control([String: Any])
     }
 
     static let connectTimeout = 3.0
@@ -33,10 +36,19 @@ final class StreamClient: NSObject, URLSessionWebSocketDelegate {
 
     private let lock = NSLock()
     private var _lastMessageAt = 0.0
+    private var _lastVideoAt = 0.0
+    private var _openedAt = 0.0
+    private var _controls = 0
     private var _isOpen = false
     private var _reconnects = 0
     private var _attempts = 0
     var lastMessageAt: Double { lock.lock(); defer { lock.unlock() }; return _lastMessageAt }
+    /// letzte Video-Nachricht (0x02) dieser Verbindung; 0 = noch keine seit dem Verbinden
+    var lastVideoAt: Double { lock.lock(); defer { lock.unlock() }; return _lastVideoAt }
+    /// Zeitpunkt des Verbindungsaufbaus
+    var openedAt: Double { lock.lock(); defer { lock.unlock() }; return _openedAt }
+    /// Anzahl empfangener Steuer-Nachrichten (Test/Statistik)
+    var controlCount: Int { lock.lock(); defer { lock.unlock() }; return _controls }
     var isOpen: Bool { lock.lock(); defer { lock.unlock() }; return _isOpen }
     var reconnects: Int { lock.lock(); defer { lock.unlock() }; return _reconnects }
 
@@ -137,7 +149,8 @@ final class StreamClient: NSObject, URLSessionWebSocketDelegate {
         guard !opened else { return }
         opened = true
         backoff = Self.reconnectMin
-        lock.lock(); _lastMessageAt = CACurrentMediaTime(); lock.unlock()
+        let now = CACurrentMediaTime()
+        lock.lock(); _lastMessageAt = now; _openedAt = now; _lastVideoAt = 0; lock.unlock()
         setOpen(true)
         onEvent?(.opened)
     }
@@ -153,9 +166,16 @@ final class StreamClient: NSObject, URLSessionWebSocketDelegate {
             let flags = d[b + 1]
             var ts: UInt64 = 0
             for i in 2..<10 { ts = ts << 8 | UInt64(d[b + i]) }      // big-endian
+            lock.lock(); _lastVideoAt = now; lock.unlock()
             onEvent?(.video(d, offset: 10, key: flags & 1 == 1, timestampUs: ts, receivedAt: now))
+        case 0x03:
+            lock.lock(); _controls += 1; lock.unlock()
+            let json = d.subdata(in: (b + 1)..<d.endIndex)
+            if let obj = (try? JSONSerialization.jsonObject(with: json)) as? [String: Any], obj["type"] is String {
+                onEvent?(.control(obj))
+            }
         default:
-            break
+            break                                                   // unbekannter Typ: ignorieren
         }
     }
 

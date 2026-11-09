@@ -30,7 +30,8 @@ final class VirtualDisplay {
     /// Empirically verified (macOS 26.5, M4 Pro): with `hiDPI = 1`, the CGVirtualDisplayMode
     /// width/height are interpreted as POINTS; the system backs them with 2x pixels, which must fit
     /// into maxPixelsWide/High. So for 4096x2304 px HiDPI we pass a 2048x1152 mode.
-    init(name: String, pixelWidth: Int, pixelHeight: Int, fps: Double, hiDPI: Bool) throws {
+    ///   - serialNumber: must differ from any other virtual display that is online (tests next to the installed app).
+    init(name: String, pixelWidth: Int, pixelHeight: Int, fps: Double, hiDPI: Bool, serialNumber: UInt32 = 0x0A770001) throws {
         self.pixelWidth = pixelWidth
         self.pixelHeight = pixelHeight
         self.hiDPI = hiDPI
@@ -47,7 +48,7 @@ final class VirtualDisplay {
         desc.sizeInMillimeters = CGSize(width: (hMM * aspect).rounded(), height: hMM.rounded())
         desc.vendorID = 0x1E6D      // arbitrary, non-Apple
         desc.productID = 0x4B21     // "iMac 4K 21.5"
-        desc.serialNum = 0x0A770001 // stable → macOS remembers arrangement between runs
+        desc.serialNum = serialNumber // stable → macOS remembers arrangement between runs
         desc.terminationHandler = { _, _ in
             FileHandle.standardError.write("Virtuelles Display wurde vom System beendet.\n".data(using: .utf8)!)
         }

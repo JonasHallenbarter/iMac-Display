@@ -22,6 +22,8 @@ let package = Package(
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("VideoToolbox"),
                 .linkedFramework("QuartzCore"),
+                .linkedFramework("CoreImage"),
+                .linkedFramework("CoreServices"),
             ]
         )
     ]

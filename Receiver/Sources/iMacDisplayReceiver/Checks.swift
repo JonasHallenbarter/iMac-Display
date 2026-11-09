@@ -6,6 +6,26 @@ enum CheckAction: String, Hashable, CaseIterable {
     case openNetworkPrefs, setupNetwork, resetNetwork
     case startMonitor, stopMonitor, enableAutostart, disableAutostart, repairAutostart, showLog, revealApplications
     case removeLegacyAutostart
+    case enableAutoShutdown, disableAutoShutdown, cancelShutdown, requestShutdownPermission, checkShutdownPermission
+    case openAutomationPrefs
+}
+
+/// Schalter in einer Zeile (z. B. „Automatisch ausschalten“)
+struct CheckToggle {
+    var isOn: Bool
+    var on: CheckAction
+    var off: CheckAction
+}
+
+/// Helligkeit des iMac-Bildschirms (Brightness.swift)
+struct BrightnessInfo: Equatable {
+    var supported: Bool
+    var value: Float?
+    var method: String
+    static func current() -> BrightnessInfo {
+        let s = Brightness.isSupported
+        return BrightnessInfo(supported: s, value: s ? Brightness.get() : nil, method: Brightness.methodDescription)
+    }
 }
 
 struct ActionButton: Identifiable, Hashable {
@@ -25,6 +45,7 @@ struct CheckItem: Identifiable {
     var actions: [ActionButton] = []
     var disclosureTitle: String? = nil      // z. B. „Was wird geändert?“
     var disclosureText: String? = nil
+    var toggle: CheckToggle? = nil          // Schalter rechts neben dem Titel
 }
 
 /// Alles, was die Checkliste anzeigt (wird alle 2 s neu ermittelt; für Vorschaubilder frei setzbar).
@@ -39,6 +60,8 @@ struct Facts {
     var badLocation: String?
     var autoLogin: String?
     var legacyAgent = false
+    var autoShutdown = AutoShutdownInfo()
+    var brightness: BrightnessInfo?
 
     var primary: WiredInterface? { wired.first(where: { $0.linkActive }) ?? wired.first }
 
@@ -60,7 +83,7 @@ struct Facts {
 
 enum Checks {
     static func build(_ f: Facts) -> [CheckItem] {
-        [decoder(f), cable(f), address(f), macbook(f), monitor(f), picture(f), autostart(f)]
+        [decoder(f), cable(f), address(f), macbook(f), monitor(f), picture(f), brightness(f), autostart(f), autoShutdown(f)]
     }
 
     static func decoder(_ f: Facts) -> CheckItem {
@@ -145,7 +168,7 @@ enum Checks {
             } else if f.primary?.hasOurIP == false {
                 hint = "Zuerst die Netzwerkadresse \(Config.myIP) einrichten (siehe oben)."
             } else {
-                hint = "Läuft die iMac-Display-App auf dem MacBook und ist „Übertragung aktiv“ eingeschaltet? "
+                hint = "Läuft die App „iMac Display“ auf dem MacBook? "
                     + "MacBook-Adresse muss \(Config.hostIP) sein (dort ebenfalls ohne Router)."
             }
             return CheckItem(id: "macbook", status: .warn, title: title, detail: "Keine Antwort von \(Config.host).", hint: hint)
@@ -180,11 +203,15 @@ enum Checks {
         case .waiting(let connected):
             if connected {
                 return CheckItem(id: "picture", status: .neutral, title: title, detail: "Verbunden – warte auf Bild …",
-                                 hint: "Das MacBook sendet gerade kein Bild. Dort im Menü „Übertragung aktiv“ prüfen.")
+                                 hint: "Das MacBook sendet gerade kein Bild. Dort in „iMac Display“ auf „Verbinden“ klicken.")
             }
             return CheckItem(id: "picture", status: .neutral, title: title,
                              detail: "Kein Signal – der Bildschirm zeigt „Aktuell kein aktiver Monitor“.",
                              hint: "Das Bild erscheint von selbst, sobald das MacBook überträgt (siehe „MacBook erreichbar“).")
+        case .standby:
+            return CheckItem(id: "picture", status: .neutral, title: title,
+                             detail: "MacBook ist bereit, aber noch nicht verbunden – der Bildschirm zeigt „Jetzt verbinden“.",
+                             hint: "Auf dem MacBook in „iMac Display“ auf „Verbinden“ klicken. Danach verbindet es sich künftig von selbst.")
         case .playing(let fps, let w, let h, let hw):
             let dec = hw == false ? " · Software-Dekodierung" : ""
             return CheckItem(id: "picture", status: .ok, title: title,
@@ -239,12 +266,101 @@ enum Checks {
         }
     }
 
+    static func brightness(_ f: Facts) -> CheckItem {
+        let title = "Helligkeit"
+        guard let b = f.brightness else {
+            return CheckItem(id: "brightness", status: .neutral, title: title, detail: "Wird geprüft …")
+        }
+        if b.supported, let v = b.value {
+            return CheckItem(id: "brightness", status: .ok, title: title,
+                             detail: "\(Int((v * 100).rounded())) % – am MacBook in „iMac Display“ einstellbar (\(b.method)).")
+        }
+        return CheckItem(id: "brightness", status: .neutral, title: title,
+                         detail: "Lässt sich an diesem Bildschirm nicht per Software einstellen (\(b.method)).",
+                         hint: "Helligkeit hier mit den Tasten bzw. in den Systemeinstellungen → Monitore einstellen.")
+    }
+
+    static func autoShutdown(_ f: Facts) -> CheckItem {
+        let a = f.autoShutdown
+        let limit = AutoShutdown.duration(a.idleLimit)
+        let title = "Automatisch ausschalten nach \(limit) ohne Bild"
+        let toggle = CheckToggle(isOn: a.enabled, on: .enableAutoShutdown, off: .disableAutoShutdown)
+        let how = "Kommt \(limit) lang kein Bild vom MacBook und benutzt niemand Maus oder Tastatur dieses iMac, erscheint "
+            + "\(Int(a.countdownLength)) Sekunden lang ein Countdown. Danach wird der iMac normal ausgeschaltet (wie Apple-Menü → "
+            + "Ausschalten; ein Programm mit ungesicherten Änderungen kann das verhindern). Abbrechen: Maus bewegen oder eine Taste drücken. "
+            + "Statt in den Ruhezustand zu gehen, schaltet sich der iMac so ganz aus.\n\n"
+            + "Technik: Apple Event „kAEShutDown“ an loginwindow. macOS fragt dafür einmal nach der Erlaubnis "
+            + "(„… möchte „loginwindow“ steuern“ → OK). Ausschalten: Schalter rechts."
+        let automation = ActionButton(title: "Automation-Einstellungen öffnen", action: .openAutomationPrefs)
+        var actions: [ActionButton] = []
+        var status: CheckStatus = .ok
+        var detail: String
+        var hint: String?
+        guard a.enabled else {
+            return CheckItem(id: "autoshutdown", status: .neutral, title: title,
+                             detail: "Aus – der iMac bleibt an (bzw. geht wie eingestellt in den Ruhezustand).",
+                             disclosureTitle: "Wie funktioniert das?", disclosureText: how, toggle: toggle)
+        }
+        switch a.phase {
+        case .off:
+            detail = "An."
+        case .picture:
+            detail = "An – wartet – Bild läuft."
+        case .waiting(let r):
+            let t = r >= 60 ? "\(Int(ceil(r / 60))) Min." : "\(max(1, Int(ceil(r)))) s"
+            detail = "An – Ausschalten in \(t), falls kein Bild kommt."
+        case .countdown(let r):
+            status = .warn
+            detail = "Wird in \(r) s ausgeschaltet – Maus bewegen oder Taste drücken zum Abbrechen."
+            actions = [ActionButton(title: "Abbrechen", action: .cancelShutdown, prominent: true)]
+        case .requested:
+            detail = "Ausschalten angefordert – der iMac fährt herunter …"
+        }
+        let blocked = a.permission == .denied
+        switch a.lastResult {
+        case .failed(let code, let msg)?:
+            status = .error
+            detail += "\nLetzter Versuch fehlgeschlagen: \(msg)."
+            if code == -1743 || code == -1744 || blocked {
+                hint = "macOS hat das Ausschalten blockiert. Systemeinstellungen → Sicherheit & Datenschutz → Datenschutz → Automation: "
+                    + "unter „\(Config.appName)“ den Haken bei „loginwindow“ setzen. Danach „Erlaubnis prüfen“."
+                actions += [automation, ActionButton(title: "Erlaubnis prüfen", action: .checkShutdownPermission)]
+            } else {
+                hint = "Der nächste Versuch kommt nach weiteren \(limit) ohne Bild. Details stehen im Protokoll."
+                actions += [ActionButton(title: "Protokoll anzeigen", action: .showLog)]
+            }
+        case .notCompleted?:
+            if status == .ok { status = .warn }
+            detail += "\nDer letzte Versuch wurde abgebrochen (z. B. von einem Programm mit ungesicherten Änderungen)."
+        case .simulated(let why)?:
+            let at = f.autoShutdown.lastResultAt.map { Self.timeFormatter.string(from: $0) } ?? "?"
+            detail += "\nTestmodus: hätte um \(at) ausgeschaltet – nur protokolliert (\(why))."
+        default:
+            if blocked {
+                status = .error
+                hint = "macOS erlaubt dieser App das Ausschalten nicht. Systemeinstellungen → Sicherheit & Datenschutz → Datenschutz → "
+                    + "Automation: unter „\(Config.appName)“ den Haken bei „loginwindow“ setzen. Danach „Erlaubnis prüfen“."
+                actions += [automation, ActionButton(title: "Erlaubnis prüfen", action: .checkShutdownPermission)]
+            } else if a.permission == .needsConsent {
+                if status == .ok { status = .warn }
+                hint = "Einmal „Erlauben …“ klicken und im macOS-Dialog „OK“ wählen – sonst fragt macOS erst beim Ausschalten."
+                actions += [ActionButton(title: "Erlauben …", action: .requestShutdownPermission, prominent: true)]
+            }
+        }
+        return CheckItem(id: "autoshutdown", status: status, title: title, detail: detail, hint: hint, actions: actions,
+                         disclosureTitle: "Wie funktioniert das?", disclosureText: how, toggle: toggle)
+    }
+
+    static let timeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "de_DE"); f.dateFormat = "HH:mm:ss"; return f
+    }()
+
     /// Textform (für --print-status und Tests)
     static func text(_ items: [CheckItem]) -> String {
         items.map { i in
             let s: String
             switch i.status { case .ok: s = "[OK]  "; case .warn: s = "[WARN]"; case .error: s = "[ERR] "; case .neutral: s = "[--]  " }
-            var line = "\(s) \(i.title): \(i.detail)"
+            var line = "\(s) \(i.title)\(i.toggle.map { $0.isOn ? " [Schalter: an]" : " [Schalter: aus]" } ?? ""): \(i.detail)"
             if let h = i.hint { line += "\n        Was tun? \(h)" }
             if !i.actions.isEmpty { line += "\n        Buttons: " + i.actions.map { $0.title + ($0.enabled ? "" : " (inaktiv)") }.joined(separator: " | ") }
             return line

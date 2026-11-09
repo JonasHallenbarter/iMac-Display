@@ -6,9 +6,12 @@ import ServiceManagement
 /// Owns server, encoder and the on-demand virtual display + capture. Used in both modes:
 /// CLI (stdout logs, Ctrl+C) and menu bar app (NSStatusItem, setup window, login item).
 ///
-/// Lifecycle of the virtual display (unless --always-on / --test-pattern):
-///   first WebSocket client → create display, start capture, force keyframe
-///   no client for `idleTimeout` seconds → stop capture, destroy display.
+/// Lifecycle of the virtual display (unless --always-on / --test-pattern), docs/PROTOCOL.md "Erweiterung v2":
+///   persisted intent `connectWanted` ("Verbinden" / "Trennen"; CLI without --manual-connect: always on)
+///   intent on AND iMac client connected → create display, start capture, force keyframe
+///   no client for `idleTimeout` seconds → stop capture, destroy display (intent stays → automatic reconnect)
+///   intent off ("Trennen") → display removed immediately; the iMac shows its idle screen.
+/// Every state change is sent to the receivers as sticky control {"type":"status","active","autoReconnect"}.
 /// All state lives on the main thread. Callbacks from other threads are delivered with
 /// `onMainRunLoop` (CFRunLoopPerformBlock) instead of DispatchQueue.main: display creation and modal
 /// alerts spin nested run loops, and the GCD main queue is not drained inside a running main-queue block.
@@ -39,6 +42,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
     private var clientIP: String?
     private var clientStats: [String: Any]?
 
+    // connection intent + state (PROTOCOL.md v2)
+    private let prefs: UserDefaults
+    private let intentPersisted: Bool
+    private var connectWanted: Bool
+    private var phase: ConnectionPhase = .unavailable
+    private var phaseLogged = false
+    private var sentStatus: (active: Bool, autoReconnect: Bool)?
+    private var gotFirstFrame = false
+    private let firstFrame = FirstFrameFlag()
+    private var activationError: String?
+
+    // iMac brightness (reported by the receiver)
+    private var brightnessSupported: Bool?
+    private var brightnessValue: Double?
+    private var receiverVersion: String?
+    private var brightnessPending: Double?
+    private var brightnessLastSent = Date.distantPast
+    private var brightnessFlushScheduled = false
+    private var brightnessDeferredReport: Double?
+    private var brightnessLastLog = Date.distantPast
+
     // demo window
     private var demoWanted: Bool
     private var demo: DemoWindowController?
@@ -64,8 +88,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
     // UI (app mode)
     private var statusItem: NSStatusItem?
     private let statusLine = NSMenuItem(title: "Warte auf iMac …", action: nil, keyEquivalent: "")
+    private let connectItem = NSMenuItem(title: "Jetzt verbinden", action: nil, keyEquivalent: "")
+    private let brightnessMenuItem = NSMenuItem(title: "Helligkeit iMac", action: nil, keyEquivalent: "")
+    private let brightnessInfoItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let brighterItem = NSMenuItem(title: "Heller", action: nil, keyEquivalent: "")
+    private let darkerItem = NSMenuItem(title: "Dunkler", action: nil, keyEquivalent: "")
     private let demoItem = NSMenuItem(title: "Testbild auf iMac anzeigen", action: nil, keyEquivalent: "")
     private let transmissionItem = NSMenuItem(title: "Übertragung aktiv", action: nil, keyEquivalent: "")
+    private lazy var menu: NSMenu = buildMenu()
 
     private var timers: [Timer] = []
     private var sigSources: [DispatchSourceSignal] = []
@@ -80,27 +110,41 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         self.server = StreamServer(options: .init(port: options.port, allowAnyNetwork: options.allowAnyNetwork),
                                    indexHTML: indexHTML)
         self.encoder = H264Encoder(settings: .init(fps: options.fps, bitrateMbit: options.bitrate))
+        // Tests use their own defaults domain (--defaults-suite) so the installed app's settings stay untouched.
+        let prefs = options.defaultsSuite.flatMap { UserDefaults(suiteName: $0) } ?? .standard
+        self.prefs = prefs
+        // App: intent persisted, default off. CLI: old automatic behaviour unless --manual-connect.
+        let persisted = appMode || options.manualConnect
+        self.intentPersisted = persisted
+        prefs.register(defaults: ["transmissionEnabled": true, "connectWanted": false])
+        if options.connect { connectWanted = true }
+        else if persisted { connectWanted = prefs.bool(forKey: "connectWanted") }
+        else { connectWanted = true }
         super.init()
         if appMode {
-            UserDefaults.standard.register(defaults: ["transmissionEnabled": true])
-            transmissionEnabled = UserDefaults.standard.bool(forKey: "transmissionEnabled")
+            transmissionEnabled = prefs.bool(forKey: "transmissionEnabled")
         }
     }
 
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if appMode {
+        if appMode && opts.defaultsSuite == nil {
             DistributedNotificationCenter.default().addObserver(forName: showSetupNotification, object: nil,
                                                                 queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { logLine("Zweiter Start erkannt – öffne „Einrichtung & Status“"); self?.showSetup(nil) }
             }
         }
         if DryRun.isOn { logLine("Dry-Run aktiv: Systemänderungen werden nur protokolliert.") }
+        if let s = opts.defaultsSuite { logLine("Einstellungen aus Domäne \(s) (Test)") }
 
         let server = self.server, encoder = self.encoder
+        let firstFrame = self.firstFrame
         encoder.onConfig = { server.setConfig($0) }
-        encoder.onFrame = { data, key, ts in server.broadcastVideo(data, isKeyframe: key, timestampUs: ts) }
+        encoder.onFrame = { [weak self] data, key, ts in
+            server.broadcastVideo(data, isKeyframe: key, timestampUs: ts)
+            if firstFrame.take() { onMainRunLoop { self?.firstFrameEncoded() } }
+        }
         server.onClientConnected = { [weak self] in
             encoder.requestKeyframe()
             onMainRunLoop { self?.clientConnected() }
@@ -112,10 +156,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
                 self?.clientStats = stats
             }
         }
+        server.onClientMessage = { [weak self] ip, message in
+            onMainRunLoop { self?.clientMessage(ip: ip, message) }
+        }
 
         if appMode { setUpStatusItem() }
         installSignalHandlers()
 
+        publishState() // sticky status is stored before the first client can connect
         if transmissionEnabled {
             startServer()
             if let e = serverError, !appMode { fail("Server konnte nicht starten (Port \(opts.port)): \(e)", code: 1) }
@@ -126,9 +174,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         if opts.testPattern {
             if transmissionEnabled { startTestPattern() }
         } else {
-            print(opts.alwaysOn
-                  ? "Virtuelles Display: dauerhaft (--always-on)"
-                  : "Virtuelles Display wird angelegt, sobald der iMac verbunden ist (und \(Int(opts.idleTimeout)) s nach dem Trennen entfernt).")
+            if opts.alwaysOn {
+                print("Virtuelles Display: dauerhaft (--always-on)")
+            } else if connectWanted {
+                print("Virtuelles Display wird angelegt, sobald der iMac verbunden ist (und \(Int(opts.idleTimeout)) s nach dem Trennen entfernt; "
+                      + "kommt der iMac wieder, wird automatisch neu verbunden).")
+            } else {
+                print("Bereitschaft: Das virtuelle Display wird erst nach „Verbinden“ angelegt (Einrichtungsfenster oder Menü „Jetzt verbinden“).")
+            }
             if !opts.noCapture && !CGPreflightScreenCaptureAccess() {
                 permissionMissing = true
                 // App mode: no system prompt on its own – the setup window opens (red check) and the
@@ -143,11 +196,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         addTimer(0.5) { $0.tick() }
         addTimer(2.0) { $0.sampleStats() }
         tick()
-        let firstRun = appMode && !UserDefaults.standard.bool(forKey: "setupShown")
+        let firstRun = appMode && !prefs.bool(forKey: "setupShown")
         if firstRun || opts.setupWindow { showSetup(nil) }
         refreshSetup()
         if usesSetupUI { runProbe() }
         if !appMode { print("Läuft. Beenden mit Ctrl+C.") }
+        if opts.testStdin { startTestStdin() }
         if opts.testActions {
             onMainRunLoop(after: 3) { [weak self] in self?.runActionTest() }
         } else if opts.testUninstall {
@@ -194,15 +248,199 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
             transmissionEnabled = false
             deactivate(reason: "Übertragung ausgeschaltet")
             patternTimer?.cancel(); patternTimer = nil
+            publishState() // last status before the server goes away
             if serverRunning { server.stop() }
             serverRunning = false
             serverError = nil
             clientIP = nil; clientStats = nil
+            resetReceiverInfo()
             logLine("Übertragung ausgeschaltet (Server gestoppt, kein virtuelles Display)")
         }
-        if appMode && persist { UserDefaults.standard.set(transmissionEnabled, forKey: "transmissionEnabled") }
+        if appMode && persist { prefs.set(transmissionEnabled, forKey: "transmissionEnabled") }
+        refreshSetup()
+        if on { onMainRunLoop { [weak self] in self?.tick() } } // reconnect right away if the intent is on
+    }
+
+    // MARK: - Connection intent ("Verbinden" / "Trennen")
+
+    /// Display wanted: intent on (or --always-on), main switch on, not in test-pattern mode.
+    private var wantsDisplay: Bool {
+        transmissionEnabled && !opts.testPattern && (opts.alwaysOn || connectWanted)
+    }
+
+    func connect() {
+        guard transmissionEnabled else { logLine("Verbinden: Übertragung ist ausgeschaltet"); return }
+        setIntent(true, reason: "Verbinden")
+        nextActivationAttempt = .distantPast
+        activationError = nil
+        // Outside the button action: display creation spins a nested run loop.
+        onMainRunLoop { [weak self] in self?.tick() }
+    }
+
+    func disconnect() {
+        // Intent off and display removal as one step → exactly one status change for the receiver.
+        setIntent(false, reason: "Trennen", refresh: false)
+        deactivate(reason: "Trennen") // if the display is just being created, activate() discards it
         refreshSetup()
     }
+
+    private func setIntent(_ on: Bool, reason: String, refresh: Bool = true) {
+        guard connectWanted != on else { if refresh { refreshSetup() }; return }
+        connectWanted = on
+        if intentPersisted { prefs.set(on, forKey: "connectWanted") }
+        logLine("Verbindungswunsch \(on ? "AN" : "AUS") (\(reason))" + (intentPersisted ? " – gespeichert" : ""))
+        if refresh { refreshSetup() }
+    }
+
+    /// The big button / menu item / SIGUSR2: "Verbinden" when ready, otherwise "Trennen" where it applies.
+    private func pressMainButton(source: String) {
+        switch phase {
+        case .ready: logLine("\(source): Verbinden"); connect()
+        case .connecting, .connected, .waitingForIMac:
+            if opts.testPattern || opts.alwaysOn { logLine("\(source): Trennen geht im Test-/Dauer-Modus nicht"); return }
+            logLine("\(source): Trennen"); disconnect()
+        case .unavailable, .off: logLine("\(source): nichts zu tun (Zustand \(phase.rawValue))")
+        }
+    }
+
+    private func computePhase() -> ConnectionPhase {
+        if !transmissionEnabled { return .off }
+        guard serverRunning, serverError == nil else { return .unavailable }
+        let n = server.clientCount
+        if opts.testPattern { return n > 0 ? .connected : .unavailable }
+        if opts.alwaysOn || connectWanted {
+            if n == 0 { return .waitingForIMac }
+            if display != nil && (opts.noCapture || (capturing && gotFirstFrame)) { return .connected }
+            return .connecting
+        }
+        return n > 0 ? .ready : .unavailable
+    }
+
+    /// Why "connecting" does not progress (shown on the big button).
+    private var connectProblem: String? {
+        guard phase == .connecting else { return nil }
+        if permissionMissing && !opts.noCapture { return "Bildschirmaufnahme ist nicht erlaubt" }
+        if display == nil, let e = activationError { return e }
+        return nil
+    }
+
+    /// Recomputes the phase; logs changes and sends the sticky `status` control whenever it changes.
+    private func publishState() {
+        let p = computePhase()
+        if p != phase || !phaseLogged {
+            logLine("Zustand: \(phaseLogged ? phase.rawValue + " → " : "")\(p.rawValue)")
+            phase = p
+            phaseLogged = true
+        }
+        let active = transmissionEnabled && (opts.testPattern ? patternTimer != nil : display != nil)
+        let auto = opts.testPattern || opts.alwaysOn || connectWanted
+        if sentStatus?.active != active || sentStatus?.autoReconnect != auto {
+            sentStatus = (active, auto)
+            server.broadcastControl(["type": "status", "active": active, "autoReconnect": auto], sticky: true)
+            logLine("Status an iMac: active=\(active) autoReconnect=\(auto)")
+        }
+    }
+
+    private func firstFrameEncoded() {
+        guard display != nil, !gotFirstFrame else { return }
+        gotFirstFrame = true
+        refreshSetup()
+    }
+
+    // MARK: - Client messages (hello, brightness)
+
+    private func clientMessage(ip: String, _ m: [String: Any]) {
+        guard serverRunning else { return }
+        switch m["type"] as? String {
+        case "hello":
+            let app = m["app"] as? String ?? "?"
+            receiverVersion = (m["version"] as? String) ?? (m["version"] as? NSNumber)?.stringValue
+            clientIP = ip
+            logLine("Hallo von \(ip): \(app) \(receiverVersion ?? "")")
+            refreshSetup()
+        case "brightness":
+            clientIP = clientIP ?? ip
+            let supported = (m["supported"] as? Bool) ?? (m["supported"] as? NSNumber)?.boolValue
+            if let s = supported, s != brightnessSupported {
+                logLine("Helligkeit iMac: \(s ? "steuerbar" : "nicht steuerbar") (\(ip))")
+            }
+            if let s = supported { brightnessSupported = s }
+            else if brightnessSupported == nil && m["value"] != nil { brightnessSupported = true }
+            if let v = (m["value"] as? NSNumber)?.doubleValue, v.isFinite {
+                applyReportedBrightness(min(1, max(0, v)))
+            }
+            refreshSetup()
+        default:
+            break
+        }
+    }
+
+    private func applyReportedBrightness(_ v: Double) {
+        // Right after sending, echoes of older values may still arrive – apply them only when it is quiet again.
+        let quiet = 0.35 - Date().timeIntervalSince(brightnessLastSent)
+        if quiet > 0 || brightnessPending != nil {
+            let schedule = brightnessDeferredReport == nil
+            brightnessDeferredReport = v
+            if schedule {
+                onMainRunLoop(after: max(0.05, quiet)) { [weak self] in
+                    guard let self, let d = self.brightnessDeferredReport else { return }
+                    self.brightnessDeferredReport = nil
+                    self.applyReportedBrightness(d)
+                    self.refreshSetup()
+                }
+            }
+            return
+        }
+        if brightnessValue.map({ abs($0 - v) >= 0.01 }) ?? true, Date().timeIntervalSince(brightnessLastLog) >= 1 {
+            brightnessLastLog = Date()
+            logLine(String(format: "Helligkeit iMac gemeldet: %.0f %%", v * 100))
+        }
+        brightnessValue = v
+    }
+
+    private func resetReceiverInfo() {
+        brightnessSupported = nil
+        brightnessValue = nil
+        receiverVersion = nil
+        brightnessPending = nil
+        brightnessDeferredReport = nil
+    }
+
+    func setBrightness(_ value: Double, final: Bool) {
+        guard serverRunning, server.clientCount > 0, brightnessSupported == true else { return }
+        let v = min(1, max(0, value))
+        brightnessValue = v // optimistic; the receiver reports the real value back
+        brightnessPending = v
+        let since = Date().timeIntervalSince(brightnessLastSent)
+        if final || since >= 0.1 {
+            flushBrightness()
+        } else if !brightnessFlushScheduled {
+            brightnessFlushScheduled = true // max. ~10 messages per second while dragging
+            onMainRunLoop(after: 0.1 - since) { [weak self] in
+                self?.brightnessFlushScheduled = false
+                self?.flushBrightness()
+            }
+        }
+    }
+
+    private func flushBrightness() {
+        guard let v = brightnessPending else { return }
+        brightnessPending = nil
+        brightnessLastSent = Date()
+        let rounded = (v * 10_000).rounded() / 10_000 // keeps 1/16 steps exact (0.0625)
+        server.broadcastControl(["type": "brightness", "value": rounded])
+        if opts.testStdin { print("TEST> gesendet brightness \(rounded)") }
+        refreshSetup()
+    }
+
+    private func stepBrightness(_ direction: Int) {
+        setupModel.update(app: currentAppStatus(), probe: probe)
+        setupModel.stepBrightness(direction)
+    }
+
+    @objc private func connectMenuAction(_ sender: Any?) { pressMainButton(source: "Menü") }
+    @objc private func brighterAction(_ sender: Any?) { stepBrightness(+1) }
+    @objc private func darkerAction(_ sender: Any?) { stepBrightness(-1) }
 
     @objc private func toggleTransmission(_ sender: Any?) {
         setTransmission(!transmissionEnabled)
@@ -218,11 +456,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
 
     private func tick() {
         guard !shuttingDown else { return }
+        defer { publishState() }
         let n = serverRunning ? server.clientCount : 0
         if n > 0 { lastClientSeen = Date() }
         if n != lastClientCount {
+            if lastClientCount == 0 && n > 0 && wantsDisplay && display == nil {
+                logLine("iMac ist wieder da – verbinde automatisch")
+            }
             lastClientCount = n
-            if n == 0 { clientIP = nil; clientStats = nil }
+            if n == 0 { clientIP = nil; clientStats = nil; resetReceiverInfo() }
             refreshSetup()
         }
         guard !transitioning else { return }
@@ -233,9 +475,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         guard !opts.testPattern else { return }
 
         if display == nil {
-            if (n > 0 || opts.alwaysOn) && Date() >= nextActivationAttempt { activate() }
+            if wantsDisplay && (n > 0 || opts.alwaysOn) && Date() >= nextActivationAttempt { activate() }
+        } else if !wantsDisplay {
+            deactivate(reason: "Trennen")
         } else if !opts.alwaysOn && n == 0 && Date().timeIntervalSince(lastClientSeen) >= opts.idleTimeout {
-            deactivate(reason: "seit \(Int(opts.idleTimeout)) s kein iMac verbunden")
+            deactivate(reason: "seit \(Int(opts.idleTimeout)) s kein iMac verbunden – verbindet automatisch wieder, sobald er da ist")
         }
     }
 
@@ -253,22 +497,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         transitioning = true
         defer { transitioning = false }
         generation += 1
+        gotFirstFrame = false
+        refreshSetup() // "connecting" is visible while the display is being created
         let d: VirtualDisplay
         do {
             d = try VirtualDisplay(name: opts.name, pixelWidth: opts.width, pixelHeight: opts.height,
-                                   fps: Double(opts.fps), hiDPI: opts.hiDPI)
+                                   fps: Double(opts.fps), hiDPI: opts.hiDPI, serialNumber: opts.displaySerial)
         } catch {
             logLine("Virtuelles Display konnte nicht erstellt werden: \(error) – neuer Versuch in 5 s")
+            activationError = "Virtueller Bildschirm ließ sich nicht anlegen – neuer Versuch …"
             nextActivationAttempt = Date().addingTimeInterval(5)
             return
         }
-        if !transmissionEnabled || shuttingDown {
-            // Switched off (or quitting) while the display was being created (nested run loop).
+        if !wantsDisplay || shuttingDown {
+            // Switched off, "Trennen" or quitting while the display was being created (nested run loop).
             _ = d.destroy()
+            logLine("Virtuelles Display gleich wieder entfernt (inzwischen getrennt/ausgeschaltet)")
             return
         }
+        activationError = nil
         displaysCreated += 1
         display = d
+        firstFrame.arm()
         logLine("Virtuelles Display \"\(opts.name)\" erstellt (#\(displaysCreated)): \(d.currentModeDescription())")
         if !d.hasWantedMode { fixMode(generation: generation, attempt: 1) }
 
@@ -389,6 +639,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         capture?.stop()
         capture = nil
         capturing = false
+        firstFrame.disarm()
+        gotFirstFrame = false
         encoder.stop() // idle refresh off, session + cached frame released
         if let d = display {
             let gone = d.destroy()
@@ -473,17 +725,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         if !transmissionEnabled { return "Übertragung ausgeschaltet" }
         if serverError != nil { return "Fehler: Server startet nicht (Port \(opts.port))" }
         let n = server.clientCount
-        if n == 0 {
-            if permissionMissing && !opts.testPattern { return "Warte auf iMac … (Bildschirmaufnahme nicht erlaubt)" }
+        let more = n > 1 ? " (\(n) Clients)" : ""
+        switch phase {
+        case .off: return "Übertragung ausgeschaltet"
+        case .unavailable:
+            if usesSetupUI { return "Kein iMac – " + setupModel.unavailableCause }
             return "Warte auf iMac …"
-        }
-        let who = n == 1 ? "iMac verbunden" : "iMac verbunden (\(n) Clients)"
-        if opts.testPattern || capturing {
+        case .ready: return "iMac bereit – „Jetzt verbinden“" + more
+        case .connecting:
+            if let p = connectProblem { return "Verbinden geht nicht: \(p)" }
+            return "Verbinde mit dem iMac …"
+        case .connected:
             let prefix = opts.testPattern ? "Testbild-Modus · " : ""
-            return prefix + who + String(format: " · %.0f fps · %.0f Mbit/s", curFPS, curMbit)
+            return prefix + "Verbunden" + more + (curFPS >= 1 ? String(format: " · %.0f fps · %.0f Mbit/s", curFPS, curMbit) : " · Bild unverändert")
+        case .waitingForIMac: return "Wartet auf den iMac – verbindet automatisch"
         }
-        if permissionMissing { return who + " · Bildschirmaufnahme nicht erlaubt" }
-        return who + " · Starte Aufnahme …"
     }
 
     private func currentAppStatus() -> AppStatus {
@@ -508,12 +764,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         a.testPattern = opts.testPattern
         a.loginStatus = SMAppService.mainApp.status
         a.dryRun = DryRun.isOn
+        a.phase = phase
+        a.connectWanted = opts.alwaysOn || connectWanted
+        a.connectProblem = connectProblem
+        a.brightnessSupported = brightnessSupported
+        a.brightnessValue = brightnessValue
+        a.receiverVersion = receiverVersion
         return a
     }
 
     /// Recomputes the setup checklist and the menu bar state. Cheap; called often.
     private func refreshSetup() {
-        if usesSetupUI {
+        publishState()
+        if usesSetupUI || opts.testStdin {
             setupModel.update(app: currentAppStatus(), probe: probe)
             let errors = setupModel.errorRowIDs
             hasErrorCheck = !errors.isEmpty
@@ -546,38 +809,88 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
     }
 
     private func updateStatus() {
+        updateMenuItems()
         guard appMode, let item = statusItem else { return }
-        statusLine.title = statusText()
-        demoItem.state = demoWanted ? .on : .off
-        transmissionItem.state = transmissionEnabled ? .on : .off
-        let connected = serverRunning && server.clientCount > 0
         let bad = hasErrorCheck || serverError != nil
-        let symbol = bad ? "display.trianglebadge.exclamationmark" : "display"
-        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "iMac Display")
-            ?? NSImage(systemSymbolName: bad ? "exclamationmark.triangle" : "display", accessibilityDescription: "iMac Display")
-        if let img {
+        // Icon: dim without iMac, green when "Verbinden" is possible, filled screen while connected.
+        var names = ["display"]
+        var tint: NSColor?
+        var dim = false
+        if bad {
+            names = ["display.trianglebadge.exclamationmark", "exclamationmark.triangle"]
+        } else {
+            switch phase {
+            case .ready: names = ["play.display", "display"]; tint = .systemGreen
+            case .connected: names = ["inset.filled.tv", "tv.inset.filled", "display"]
+            case .connecting: names = ["display"]
+            case .waitingForIMac, .unavailable, .off: names = ["display"]; dim = true
+            }
+        }
+        if let img = names.lazy.compactMap({ NSImage(systemSymbolName: $0, accessibilityDescription: "iMac Display") }).first {
             img.isTemplate = true
             item.button?.image = img
             item.button?.title = ""
         } else {
+            item.button?.image = nil
             item.button?.title = bad ? "iMac !" : "iMac"
         }
-        item.button?.appearsDisabled = !connected && !bad
+        item.button?.contentTintColor = tint
+        item.button?.appearsDisabled = dim
         item.button?.toolTip = "iMac Display – " + statusLine.title
+    }
+
+    private func updateMenuItems() {
+        statusLine.title = statusText()
+        demoItem.state = demoWanted ? .on : .off
+        transmissionItem.state = transmissionEnabled ? .on : .off
+        switch phase {
+        case .connecting, .connected, .waitingForIMac:
+            connectItem.title = "Trennen"
+            connectItem.isEnabled = !opts.testPattern && !opts.alwaysOn
+        default:
+            connectItem.title = "Jetzt verbinden"
+            connectItem.isEnabled = phase == .ready
+        }
+        let bOK = serverRunning && server.clientCount > 0 && brightnessSupported == true
+        brightnessMenuItem.isEnabled = bOK
+        brighterItem.isEnabled = bOK && (brightnessValue ?? 0) < 0.999
+        darkerItem.isEnabled = bOK && (brightnessValue ?? 1) > 0.001
+        if bOK, let v = brightnessValue {
+            brightnessInfoItem.title = String(format: "Aktuell: %.0f %%", v * 100)
+        } else {
+            brightnessInfoItem.title = setupModel.brightnessHint ?? "Helligkeit unbekannt"
+        }
     }
 
     // MARK: - Menu bar
 
-    private func setUpStatusItem() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem = item
+    private func buildMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
         menu.delegate = self
 
         statusLine.isEnabled = false
         menu.addItem(statusLine)
+        connectItem.target = self
+        connectItem.action = #selector(connectMenuAction(_:))
+        menu.addItem(connectItem)
         menu.addItem(.separator())
+
+        let bMenu = NSMenu()
+        bMenu.autoenablesItems = false
+        brightnessInfoItem.isEnabled = false
+        bMenu.addItem(brightnessInfoItem)
+        brighterItem.target = self
+        brighterItem.action = #selector(brighterAction(_:))
+        brighterItem.image = NSImage(systemSymbolName: "sun.max", accessibilityDescription: nil)
+        bMenu.addItem(brighterItem)
+        darkerItem.target = self
+        darkerItem.action = #selector(darkerAction(_:))
+        darkerItem.image = NSImage(systemSymbolName: "sun.min", accessibilityDescription: nil)
+        bMenu.addItem(darkerItem)
+        brightnessMenuItem.submenu = bMenu
+        brightnessMenuItem.image = NSImage(systemSymbolName: "sun.max", accessibilityDescription: nil)
+        menu.addItem(brightnessMenuItem)
 
         let setup = NSMenuItem(title: "Einrichtung & Status …", action: #selector(showSetup(_:)), keyEquivalent: ",")
         setup.target = self
@@ -595,9 +908,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         let quit = NSMenuItem(title: "Beenden", action: #selector(quit(_:)), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+        return menu
+    }
 
+    private func setUpStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = item
         item.menu = menu
         updateStatus()
+    }
+
+    /// One line per menu item (tests): "Titel [aus]" / "Titel ✓", submenus in brackets.
+    private func menuSnapshot() -> [String] {
+        _ = menu
+        updateMenuItems()
+        func line(_ i: NSMenuItem) -> String {
+            if i.isSeparatorItem { return "—" }
+            var t = i.title + (i.state == .on ? " ✓" : "") + (i.isEnabled ? "" : " [aus]")
+            if let sub = i.submenu { t += " { " + sub.items.map(line).joined(separator: " | ") + " }" }
+            return t
+        }
+        return menu.items.map(line)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -606,7 +937,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
 
     @objc func showSetup(_ sender: Any?) {
         if setupWindow == nil { setupWindow = SetupWindowController(model: setupModel) }
-        if appMode { UserDefaults.standard.set(true, forKey: "setupShown") }
+        if appMode { prefs.set(true, forKey: "setupShown") }
         setupModel.update(app: currentAppStatus(), probe: probe)
         setupWindow?.show()
         if Date().timeIntervalSince(lastProbe) > 1 { runProbe() }
@@ -921,6 +1252,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         logLine("TEST Server läuft: \(serverRunning), Status: \(statusText())")
         step("Testbild EIN") { toggleDemo(nil) }
         step("Testbild AUS") { toggleDemo(nil) }
+        logLine("TEST Zustand: \(phase.rawValue), Knopf: \(setupModel.button.title), Menü: \(menuSnapshot().joined(separator: " | "))")
         logLine("TEST Deinstallation (alle Haken) …")
         opts.testUninstall = true
         performUninstall(UninstallOptions())
@@ -984,6 +1316,112 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
         }
         usr1.resume()
         sigSources.append(usr1)
+        // Test hook: `kill -USR2 <pid>` presses the big button ("Verbinden" when ready, otherwise "Trennen").
+        signal(SIGUSR2, SIG_IGN)
+        let usr2 = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .global())
+        usr2.setEventHandler { [weak self] in
+            onMainRunLoop { self?.pressMainButton(source: "SIGUSR2") }
+        }
+        usr2.resume()
+        sigSources.append(usr2)
+    }
+
+    // MARK: - Test commands on stdin (--test-stdin)
+
+    private func startTestStdin() {
+        weak let weakSelf = self
+        let t = Thread {
+            while let line = readLine() {
+                let cmd = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if cmd.isEmpty { continue }
+                onMainRunLoop { weakSelf?.testCommand(cmd) }
+            }
+        }
+        t.name = "imac-display.test-stdin"
+        t.start()
+        print("TEST> Testbefehle auf stdin: state, press, connect, disconnect, brightness <0…1> [final], drag <von> <bis> <schritte> <ms>, "
+              + "step <+1|-1>, menu, menuclick <Titel>, transmission on|off, setup, closesetup, quit")
+    }
+
+    private func testState() -> String {
+        setupModel.update(app: currentAppStatus(), probe: probe)
+        let b = setupModel.button
+        var o: [String: Any] = [
+            "phase": phase.rawValue, "intent": connectWanted, "display": display != nil, "transmission": transmissionEnabled,
+            "clients": serverRunning ? server.clientCount : 0, "displaysCreated": displaysCreated,
+            "button": b.title, "buttonEnabled": b.enabled, "buttonStyle": "\(b.style)", "caption": b.caption ?? "",
+            "disconnectShown": b.showDisconnect, "statusLine": statusText(),
+            "brightnessEnabled": setupModel.brightnessEnabled, "brightnessHint": setupModel.brightnessHint ?? "",
+            "menu": menuSnapshot(),
+        ]
+        if let s = sentStatus { o["status"] = ["active": s.active, "autoReconnect": s.autoReconnect] }
+        if let v = brightnessSupported { o["brightnessSupported"] = v }
+        if let v = brightnessValue { o["brightnessValue"] = v }
+        if let v = receiverVersion { o["receiverVersion"] = v }
+        let data = (try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys])) ?? Data()
+        return String(data: data, encoding: .utf8) ?? "{}"
+    }
+
+    private func testCommand(_ line: String) {
+        let parts = line.split(separator: " ").map(String.init)
+        let arg = { (i: Int) -> String? in parts.count > i ? parts[i] : nil }
+        switch parts[0] {
+        case "state": print("TEST> state " + testState())
+        case "press": setupModel.update(app: currentAppStatus(), probe: probe); setupModel.pressMainButton()
+            print("TEST> press (Knopf aktiv: \(setupModel.button.enabled))")
+        case "connect": connect(); print("TEST> connect")
+        case "disconnect": disconnect(); print("TEST> disconnect")
+        case "brightness":
+            guard let v = arg(1).flatMap(Double.init) else { print("TEST> Fehler: brightness <wert>"); return }
+            setupModel.update(app: currentAppStatus(), probe: probe)
+            setBrightness(v, final: arg(2) == "final")
+            print("TEST> brightness \(v)")
+        case "drag":
+            // Simulates dragging the slider: `steps` values from `from` to `to`, one every `ms` ms, then release.
+            guard let from = arg(1).flatMap(Double.init), let to = arg(2).flatMap(Double.init),
+                  let steps = arg(3).flatMap(Int.init), let ms = arg(4).flatMap(Double.init), steps > 0 else {
+                print("TEST> Fehler: drag <von> <bis> <schritte> <ms>"); return
+            }
+            for i in 0...steps {
+                let v = from + (to - from) * Double(i) / Double(steps)
+                onMainRunLoop(after: Double(i) * ms / 1000) { [weak self] in
+                    self?.setBrightness(v, final: i == steps)
+                    if i == steps { print("TEST> drag fertig (\(steps + 1) Werte)") }
+                }
+            }
+        case "step":
+            stepBrightness(arg(1) == "-1" ? -1 : 1)
+            print("TEST> step \(arg(1) ?? "+1")")
+        case "menu": print("TEST> menu " + menuSnapshot().joined(separator: " | "))
+        case "menuclick":
+            let title = parts.dropFirst().joined(separator: " ")
+            func find(_ items: [NSMenuItem]) -> NSMenuItem? {
+                for i in items {
+                    if i.title == title { return i }
+                    if let sub = i.submenu, let f = find(sub.items) { return f }
+                }
+                return nil
+            }
+            _ = menuSnapshot()
+            guard let item = find(menu.items) else { print("TEST> menuclick: „\(title)“ nicht gefunden"); return }
+            guard item.isEnabled, let action = item.action else { print("TEST> menuclick: „\(title)“ ist deaktiviert"); return }
+            NSApp.sendAction(action, to: item.target, from: item)
+            print("TEST> menuclick \(title)")
+        case "transmission": setTransmission(arg(1) != "off"); print("TEST> transmission \(transmissionEnabled)")
+        case "setup":
+            if setupWindow == nil { setupWindow = SetupWindowController(model: setupModel) }
+            setupModel.update(app: currentAppStatus(), probe: probe)
+            setupWindow?.show(activate: false)
+            print("TEST> setup sichtbar: \(setupWindow?.isVisible == true), Animation: \(setupModel.windowVisible)")
+            onMainRunLoop(after: 0.6) { [weak self] in
+                print("TEST> setup Animationsebenen: \(self?.setupWindow?.animationLayerSummary() ?? "-")")
+            }
+        case "closesetup":
+            setupWindow?.close()
+            print("TEST> setup geschlossen, Animation: \(setupModel.windowVisible)")
+        case "quit": print("TEST> quit"); shutdown(0)
+        default: print("TEST> unbekannt: \(line)")
+        }
     }
 
     private func cleanUp(exitCode: Int32 = 0) {
@@ -1006,6 +1444,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, Setu
     private func shutdown(_ code: Int32) -> Never {
         cleanUp(exitCode: code)
         exit(code)
+    }
+}
+
+/// Set when a virtual display was created; the encoder callback (any thread) reports the first frame once.
+final class FirstFrameFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    func arm() { lock.withLock { armed = true } }
+    func disarm() { lock.withLock { armed = false } }
+    /// true exactly once after `arm()`.
+    func take() -> Bool {
+        lock.withLock {
+            guard armed else { return false }
+            armed = false
+            return true
+        }
     }
 }
 

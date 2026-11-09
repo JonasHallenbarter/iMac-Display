@@ -6,6 +6,7 @@ import QuartzCore
 enum PictureInfo: Equatable {
     case off
     case waiting(connected: Bool)
+    case standby                 // v2: MacBook verbunden, aber dort noch nicht auf „Verbinden“ geklickt
     case playing(fps: Double, width: Int, height: Int, hardware: Bool?)
     case failing(String)
 }
@@ -17,14 +18,18 @@ struct StreamConfig: Equatable {
     var fps: Double?
 }
 
-/// Der native Player: Vollbildfenster, WebSocket, H.264 → Anzeige, Ruhebild „Aktuell kein aktiver Monitor“.
-/// Verhalten wie die frühere Browser-Seite (Sources/imac-display/Resources/index.html).
+/// Der native Player: Vollbildfenster, WebSocket, H.264 → Anzeige, Ruhebild „Aktuell kein aktiver Monitor“
+/// mit QR-Code und „Jetzt verbinden“. Protokoll v2 (docs/PROTOCOL.md): Steuer-Nachrichten `status` (Bereitschaft/aktiv,
+/// alle 2 s = Lebenszeichen) und `brightness` (Helligkeit des iMac setzen); meldet `hello` und die Helligkeit zurück.
 final class PlayerController: NSObject {
     static let idleAfter = 3.0          // so lange kein neues Bild → Ruhebild
     static let keyframeWait = 1.2       // so lange auf einen Keyframe gewartet → anfordern
     static let quietRefresh = 4.0       // gar keine Nachricht → Keyframe anfordern
     static let statsEvery = 5.0
     static let shiftEvery = Double(Config.env["IMAC_RECEIVER_SHIFT_SECONDS"] ?? "") ?? 60   // Einbrennschutz
+    static let brightnessPoll = 2.0     // Helligkeit abfragen (iMac-Tasten) und bei Änderung melden
+    /// Test: Helligkeit nicht wirklich setzen, nur protokollieren (IMAC_RECEIVER_TEST_BRIGHTNESS=log)
+    static let brightnessLogOnly = Config.env["IMAC_RECEIVER_TEST_BRIGHTNESS"] == "log"
 
     struct Stats {
         var framesIn = 0, bytesIn = 0, enqueued = 0, shown = 0, skipped = 0, keyReqs = 0, errors = 0
@@ -72,6 +77,23 @@ final class PlayerController: NSObject {
     private var corruptCounter = 0                    // nur auf client.queue
     var verifier: AnyObject?                          // Testprüfung (TestHooks.swift)
 
+    // Protokoll v2: Zustand des MacBooks (nil = unbekannt, z. B. alter Server ohne `status`)
+    private(set) var serverActive: Bool?
+    private(set) var serverAutoReconnect: Bool?
+    private(set) var statusCount = 0
+    private var lastStatusAt = 0.0
+    // Helligkeit
+    private var reportedBrightness: (supported: Bool, value: Float?)?
+    private var lastSetBrightness: Float?
+    private var brightnessReportScheduled = false
+    private(set) var brightnessSets = 0
+    private(set) var brightnessReports = 0
+    private(set) var lastBrightnessReport = ""
+    private var lastBrightnessLogAt = -100.0
+    private var suppressedBrightnessLogs = 0
+    // Countdown „Automatisch ausschalten“ (nil = keiner)
+    private(set) var countdownText: String = ""
+
     /// Cmd+Q / Menü im Player (wird vom App-Delegate über das Hauptmenü ausgelöst)
     var onUserQuit: (() -> Void)?
 
@@ -108,6 +130,7 @@ final class PlayerController: NSObject {
         timers.append(timer(1.0) { $0.updateWindowStats() })
         timers.append(timer(Self.statsEvery) { $0.sendStats() })
         timers.append(timer(Self.shiftEvery) { $0.root?.shiftIdleText(animated: true) })
+        timers.append(timer(Self.brightnessPoll) { $0.reportBrightness(force: false) })
         Log.write("Monitor-Modus: Player gestartet – \(fullScreen ? "Vollbild" : "Testfenster") , Ziel ws://\(host)/ws, Renderer \(renderer.name)")
     }
 
@@ -218,6 +241,15 @@ final class PlayerController: NSObject {
         renderer.setExactPixelMapping(geometry.exact)
     }
 
+    /// Player-Fenster ist auf dem Bildschirm (für den Countdown)
+    var isVisible: Bool { window?.isVisible == true && window?.isMiniaturized == false }
+
+    /// Countdown „Automatisch ausschalten“ im Player zeigen (nil = ausblenden)
+    func setCountdown(remaining: Int?, fraction: Double) {
+        root?.setCountdown(remaining: remaining, fraction: fraction)
+        countdownText = remaining.map { AutoShutdown.message($0) } ?? ""
+    }
+
     func bringToFront() {
         guard let w = window else { return }
         NSApp.activate(ignoringOtherApps: true)
@@ -265,6 +297,8 @@ final class PlayerController: NSObject {
             DispatchQueue.main.async { [weak self] in self?.opened() }
         case .closed(let why):
             DispatchQueue.main.async { [weak self] in self?.closed(why) }
+        case .control(let j):
+            DispatchQueue.main.async { [weak self] in self?.handleControl(j) }
         }
     }
 
@@ -283,8 +317,12 @@ final class PlayerController: NSObject {
         connected = true
         loggedUnreachable = false
         Log.write("Verbunden mit MacBook ws://\(host)/ws")
+        serverActive = nil; serverAutoReconnect = nil
         setWaiting()
         waitingSince = CACurrentMediaTime()          // neuer Client bekommt ohnehin gleich einen Keyframe
+        sendJSON(["type": "hello", "app": "receiver", "version": Config.version])
+        reportedBrightness = nil
+        reportBrightness(force: true)
         updateIdleText()
     }
 
@@ -292,11 +330,100 @@ final class PlayerController: NSObject {
         guard active else { return }
         let was = connected
         connected = false
+        serverActive = nil; serverAutoReconnect = nil
         if was { Log.write("Verbindung zum MacBook getrennt: \(why)") }
         else if !loggedUnreachable { loggedUnreachable = true; Log.write("MacBook \(host) nicht erreichbar (\(why)) – versuche es alle 1–2 s weiter") }
         setWaiting()
         if showingVideo { enterIdle() }
         updateIdleText()
+    }
+
+    // MARK: Steuer-Nachrichten (v2)
+
+    private func handleControl(_ j: [String: Any]) {
+        guard active else { return }
+        switch j["type"] as? String {
+        case "status":
+            statusCount += 1
+            lastStatusAt = CACurrentMediaTime()
+            let a = (j["active"] as? NSNumber)?.boolValue
+            let r = (j["autoReconnect"] as? NSNumber)?.boolValue
+            if a != serverActive {
+                Log.write(a == true ? "MacBook: Übertragung aktiv" : (a == false ? "MacBook: Bereitschaft (nicht verbunden) – „Jetzt verbinden“" : "MacBook: Status unbekannt"))
+            }
+            serverActive = a
+            serverAutoReconnect = r
+            updateIdleText()
+        case "brightness":
+            guard let n = j["value"] as? NSNumber, n.doubleValue.isFinite else {
+                Log.write("Helligkeit vom MacBook: ungültiger Wert \(String(describing: j["value"]))"); return
+            }
+            applyBrightness(Float(min(1, max(0, n.doubleValue))))
+        default:
+            break                                    // unbekannte Typen ignorieren
+        }
+    }
+
+    private func applyBrightness(_ v: Float) {
+        brightnessSets += 1
+        let ok: Bool
+        if Self.brightnessLogOnly {
+            ok = true
+        } else {
+            ok = Brightness.set(v)
+        }
+        if ok { lastSetBrightness = v }
+        let now = CACurrentMediaTime()
+        if now - lastBrightnessLogAt > 2 {
+            let what = Self.brightnessLogOnly ? "[Test] nur protokolliert" : (ok ? "gesetzt (\(Brightness.methodDescription))" : "nicht möglich (\(Brightness.methodDescription))")
+            Log.write("Helligkeit vom MacBook: \(Int((v * 100).rounded())) % – \(what)"
+                      + (suppressedBrightnessLogs > 0 ? " (+\(suppressedBrightnessLogs) weitere)" : ""))
+            lastBrightnessLogAt = now; suppressedBrightnessLogs = 0
+        } else {
+            suppressedBrightnessLogs += 1
+        }
+        // nach jedem Setzen melden – bei schnellen Folgen (Regler ziehen) höchstens alle 0,1 s, der letzte Wert immer
+        if !brightnessReportScheduled {
+            brightnessReportScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.brightnessReportScheduled = false
+                self?.reportBrightness(force: true)
+            }
+        }
+    }
+
+    /// {"type":"brightness","supported":…,"value":…} – nach dem Verbinden, nach jedem Setzen, bei Änderung (> 0,5 %)
+    private func reportBrightness(force: Bool) {
+        guard active, connected else { return }
+        let supported = Self.brightnessLogOnly || Brightness.isSupported
+        var value: Float? = Self.brightnessLogOnly ? lastSetBrightness ?? 0.5 : (supported ? Brightness.get() : nil)
+        if value == nil, supported { value = lastSetBrightness }
+        if !force, let last = reportedBrightness, last.supported == supported {
+            switch (last.value, value) {
+            case (nil, nil): return
+            case let (a?, b?) where abs(a - b) <= 0.005: return
+            default: break
+            }
+        }
+        reportedBrightness = (supported, value)
+        var j: [String: Any] = ["type": "brightness", "supported": supported]
+        if let value { j["value"] = NSDecimalNumber(string: String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), Double(value))) }
+        if Self.brightnessLogOnly { j["test"] = true }
+        brightnessReports += 1
+        lastBrightnessReport = sendJSON(j)
+    }
+
+    @discardableResult
+    private func sendJSON(_ j: [String: Any]) -> String {
+        guard let d = try? JSONSerialization.data(withJSONObject: j, options: [.sortedKeys]), let s = String(data: d, encoding: .utf8) else { return "" }
+        client.send(s)
+        return s
+    }
+
+    /// MacBook ist da, aber nicht verbunden (v2 `status active:false`) und schickt kein Video (seit dem Verbinden
+    /// noch keins bzw. seit 1,5 s keins mehr – der Status kann dem ersten Bild bis zu 2 s hinterherhinken)
+    var isStandby: Bool {
+        connected && serverActive == false && CACurrentMediaTime() - client.lastVideoAt > 1.5
     }
 
     private func handleConfig(_ j: [String: Any]?) {
@@ -379,7 +506,7 @@ final class PlayerController: NSObject {
     }
 
     func requestKeyframe(force: Bool) {
-        guard active, connected else { return }
+        guard active, connected, !isStandby else { return }     // Bereitschaft: kein Encoder → nichts anfordern
         let now = CACurrentMediaTime()
         if now - lastKeyReq < (force ? 0.25 : 1.0) { return }
         lastKeyReq = now
@@ -441,7 +568,8 @@ final class PlayerController: NSObject {
         if !showingVideo && connected && !renderer.reportsShownFrames && layerConfirmed(now) { frameShown(pts: nil) }
         if connected {
             if waitingKey && now - waitingSince > Self.keyframeWait { requestKeyframe(force: false) }
-            if now - client.lastMessageAt > Self.quietRefresh { requestKeyframe(force: false) }
+            // lange kein Video (Status-Nachrichten zählen hier nicht) → Keyframe anfordern
+            if now - max(client.lastVideoAt, client.openedAt) > Self.quietRefresh { requestKeyframe(force: false) }
         }
         updateIdleText()
         // Autostart bei der Anmeldung: Finder/Dock kommen evtl. erst danach nach vorne → in den ersten 20 s
@@ -450,18 +578,28 @@ final class PlayerController: NSObject {
         (verifier as? TickingHook)?.tick(self)
     }
 
+    /// Ruhebild: Überschrift + Hinweiszeile je nach Zustand
+    static let standbyHint = "Auf dem MacBook in „iMac Display“ auf „Verbinden“ klicken."
+    static let unreachableHint = "MacBook per Kabel anschließen und „iMac Display“ öffnen."
+
     private func updateIdleText() {
-        let t: String
+        let heading: String, t: String
         if connected {
             if let e = lastError, CACurrentMediaTime() - lastErrorAt < 5, failStreak >= 3 {
-                t = "Bild kann nicht angezeigt werden (\(e)) – neuer Versuch …"
+                heading = "Bild kann nicht angezeigt werden"
+                t = "\(e) – neuer Versuch …"
+            } else if serverActive == false {
+                heading = "Jetzt verbinden"
+                t = Self.standbyHint
             } else {
-                t = "Verbunden – warte auf Bild …"
+                heading = "Verbunden"
+                t = serverActive == true ? "Das Bild kommt gleich …" : "Warte auf das Bild des MacBooks …"
             }
         } else {
-            t = "Warte auf MacBook \(hostLabel) …"
+            heading = "Jetzt verbinden"
+            t = Self.unreachableHint
         }
-        root?.setIdleSubtitle(t)
+        root?.setIdleText(heading: heading, context: t)
     }
 
     // MARK: Statistik
@@ -499,6 +637,7 @@ final class PlayerController: NSObject {
     var picture: PictureInfo {
         if showingVideo { return .playing(fps: stats.fps, width: videoSize.w, height: videoSize.h, hardware: renderer.usingHardware) }
         if let e = lastError, failStreak >= 3, CACurrentMediaTime() - lastErrorAt < 10 { return .failing(e) }
+        if isStandby { return .standby }
         return .waiting(connected: connected)
     }
 
@@ -515,6 +654,8 @@ final class PlayerController: NSObject {
         Auflösung   \(videoSize.w)×\(videoSize.h)   Ansicht \(Int(g.pt.width))×\(Int(g.pt.height)) pt @\(g.scale)x = \(Int(g.px.width))×\(Int(g.px.height)) px \(g.exact ? "(1:1)" : "(skaliert)")
         Codec       \(config?.codec ?? "–")\(config?.fps.map { " @ \(Int($0)) fps" } ?? "") · VideoToolbox (\(renderer.name))
         Verbindung  ws://\(host)/ws   Neuverbindungen \(client.reconnects)
+        MacBook     \(serverActive.map { $0 ? "aktiv" : "Bereitschaft" } ?? "–")\(serverAutoReconnect == true ? " · verbindet automatisch" : "")   Status-Nachrichten \(statusCount)
+        Helligkeit  \(reportedBrightness.map { $0.supported ? ($0.value.map { "\(Int(($0 * 100).rounded())) %" } ?? "?") : "nicht einstellbar" } ?? "–")   gesetzt \(brightnessSets)×
         """
     }
 
@@ -534,6 +675,11 @@ final class PlayerController: NSObject {
             "fps": stats.fps, "mbps": stats.mbps, "video": "\(videoSize.w)x\(videoSize.h)",
             "viewPt": "\(Int(g.pt.width))x\(Int(g.pt.height))", "scale": g.scale, "viewPx": "\(Int(g.px.width))x\(Int(g.px.height))",
             "exact": g.exact, "renderer": renderer.name, "idleText": root?.idleTitle ?? "", "idleSub": root?.idleSubtitle ?? "",
+            "idleHeading": root?.idleHeading ?? "", "idleLink": root?.idleLink ?? "", "qrVisible": root?.qrVisible ?? false,
+            "serverActive": serverActive.map { $0 ? "true" : "false" } ?? "nil", "autoReconnect": serverAutoReconnect.map { $0 ? "true" : "false" } ?? "nil",
+            "statusCount": statusCount, "controlCount": client.controlCount, "standby": isStandby,
+            "brightnessSets": brightnessSets, "brightnessReports": brightnessReports, "lastBrightnessReport": lastBrightnessReport,
+            "countdown": countdownText,
             "idleVisible": root?.idleVisible ?? false, "statsVisible": root?.statsVisible ?? false,
             "idleOffset": root.map { "\(Int($0.idleOffset.x)),\(Int($0.idleOffset.y))" } ?? "",
             "cursorHidden": cursorHidden, "presentation": NSApp.presentationOptions.rawValue,
@@ -618,12 +764,39 @@ final class VideoHostView: NSView {
     }
 }
 
+/// Schwarze Fläche, die sich auch selbst zeichnet (damit Vorschaubilder per cacheDisplay schwarz sind)
+final class BlackView: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = CGColor(gray: 0, alpha: 1)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var isOpaque: Bool { true }
+    override func draw(_ dirtyRect: NSRect) { NSColor.black.setFill(); dirtyRect.fill() }
+}
+
+/// Ruhebild (kein Bild vom MacBook), mittig und symmetrisch, auf Schwarz:
+///
+///                 Aktuell kein aktiver Monitor            groß, hellgrau (wie bisher)
+///                      Jetzt verbinden                    Überschrift
+///     Auf dem MacBook in „iMac Display“ auf „Verbinden“ klicken.   Hinweis je nach Zustand
+///                        ▄▄▄▄▄▄▄▄
+///                        █ QR   █                         CIQRCodeGenerator, Link zum GitHub-Projekt
+///                        ▀▀▀▀▀▀▀▀
+///             github.com/JonasHallenbarter/iMac-Display   klein, gedämpft
+///
+/// Die ganze Gruppe wandert alle 60 s langsam an eine andere Stelle (Einbrennschutz).
 final class PlayerRootView: NSView {
     let videoHost: VideoHostView
-    private let idleView = NSView()
+    private let idleView = BlackView()
     private let idleBox = NSView()
-    private let titleLabel = NSTextField(labelWithString: "Aktuell kein aktiver Monitor")
-    private let subLabel = NSTextField(labelWithString: "")
+    private let titleLabel = PlayerRootView.label("Aktuell kein aktiver Monitor")
+    private let headingLabel = PlayerRootView.label("Jetzt verbinden")
+    private let contextLabel = PlayerRootView.label("")
+    private let linkLabel = PlayerRootView.label(PlayerRootView.linkText)
+    private let qrView = QRCodeView()
+    private let countdownView = CountdownView(frame: .zero)
     private let statsLabel = NSTextField(labelWithString: "")
     private let hideCursor: Bool
     private lazy var blankCursor: NSCursor = {
@@ -634,12 +807,32 @@ final class PlayerRootView: NSView {
     var hostLabel = ""
     var onKey: ((NSEvent) -> Void)?
     var onGeometryChange: (() -> Void)?
-    /// Versatz des Ruhetexts als Anteil (-1…1) von 16 % Breite / 22 % Höhe
+    /// Versatz der Gruppe als Anteil (-1…1) von 16 % Breite / 22 % Höhe (begrenzt, damit alles sichtbar bleibt)
     private var shift = CGPoint.zero
     private(set) var idleOffset = CGPoint.zero
+    /// Skalierung für das pixelgenaue QR-Raster (Vorschaubilder: 2, sonst die des Fensters)
+    var scaleOverride: CGFloat?
+
+    static let linkText = Config.projectURL.replacingOccurrences(of: "https://", with: "")
+
+    private static func label(_ s: String) -> NSTextField {
+        let l = NSTextField(labelWithString: s)
+        l.alignment = .center
+        l.isSelectable = false
+        l.drawsBackground = false
+        l.isBezeled = false
+        l.lineBreakMode = .byClipping
+        return l
+    }
 
     var idleTitle: String { titleLabel.stringValue }
-    var idleSubtitle: String { subLabel.stringValue }
+    var idleHeading: String { headingLabel.stringValue }
+    var idleSubtitle: String { contextLabel.stringValue }
+    var idleLink: String { linkLabel.stringValue }
+    var qrVisible: Bool { !idleView.isHidden && !idleBox.isHidden && qrView.code != nil }
+    /// Lage des QR-Codes in dieser Ansicht (Tests/Vorschau)
+    var qrFrame: NSRect { qrView.convert(qrView.bounds, to: self) }
+    var countdownText: String { countdownView.isHidden ? "" : countdownView.text }
     var idleVisible: Bool {
         get { !idleView.isHidden }
         set { idleView.isHidden = !newValue }
@@ -658,22 +851,19 @@ final class PlayerRootView: NSView {
         videoHost.autoresizingMask = [.width, .height]
         addSubview(videoHost)
 
-        idleView.wantsLayer = true
-        idleView.layer?.backgroundColor = CGColor(gray: 0, alpha: 1)
         idleView.frame = bounds
         idleView.autoresizingMask = [.width, .height]
         addSubview(idleView)
-        for l in [titleLabel, subLabel] {
-            l.alignment = .center
-            l.isSelectable = false
-            l.drawsBackground = false
-            l.isBezeled = false
-            idleBox.addSubview(l)
-        }
-        titleLabel.textColor = NSColor(calibratedWhite: 0xb4 / 255.0, alpha: 1)   // #b4b4b4
-        subLabel.textColor = NSColor(calibratedWhite: 0x4a / 255.0, alpha: 1)     // #4a4a4a
-        idleBox.wantsLayer = true
+        titleLabel.textColor = NSColor(calibratedWhite: 0xb4 / 255.0, alpha: 1)     // #b4b4b4 wie bisher
+        headingLabel.textColor = NSColor(calibratedWhite: 0xd0 / 255.0, alpha: 1)   // #d0d0d0
+        contextLabel.textColor = NSColor(calibratedWhite: 0x80 / 255.0, alpha: 1)   // #808080
+        linkLabel.textColor = NSColor(calibratedWhite: 0x58 / 255.0, alpha: 1)      // #585858 klein, gedämpft
+        qrView.code = QRCode.make(Config.projectURL)
+        for v in [titleLabel, headingLabel, contextLabel, qrView, linkLabel] as [NSView] { idleBox.addSubview(v) }
         idleView.addSubview(idleBox)
+
+        countdownView.isHidden = true
+        addSubview(countdownView)
 
         statsLabel.font = NSFont(name: "Menlo", size: 12) ?? .monospacedSystemFont(ofSize: 12, weight: .regular)
         statsLabel.textColor = NSColor(calibratedRed: 0, green: 1, blue: 0, alpha: 1)
@@ -695,18 +885,25 @@ final class PlayerRootView: NSView {
     override func flagsChanged(with event: NSEvent) {}
     override func rightMouseDown(with event: NSEvent) {}
     override func resetCursorRects() { if hideCursor { addCursorRect(bounds, cursor: blankCursor) } }
+    override func draw(_ dirtyRect: NSRect) { NSColor.black.setFill(); dirtyRect.fill() }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         layoutIdle()
+        layoutCountdown()
         layoutStats()
         onGeometryChange?()
     }
-    override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); onGeometryChange?() }
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        layoutIdle()                                  // QR-Raster an die neue Pixeldichte anpassen
+        onGeometryChange?()
+    }
 
-    func setIdleSubtitle(_ s: String) {
-        guard subLabel.stringValue != s else { return }
-        subLabel.stringValue = s
+    func setIdleText(heading: String, context: String) {
+        guard headingLabel.stringValue != heading || contextLabel.stringValue != context else { return }
+        headingLabel.stringValue = heading
+        contextLabel.stringValue = context
         layoutIdle()
     }
 
@@ -715,23 +912,71 @@ final class PlayerRootView: NSView {
         layoutStats()
     }
 
+    /// Countdown „Automatisch ausschalten“: mittig statt der Ruhebild-Gruppe (nil = ausblenden)
+    func setCountdown(remaining: Int?, fraction: Double) {
+        if let remaining {
+            countdownView.set(remaining: remaining, fraction: fraction)
+            if countdownView.isHidden {
+                countdownView.isHidden = false
+                idleBox.isHidden = true
+                layoutCountdown()
+            }
+        } else if !countdownView.isHidden {
+            countdownView.isHidden = true
+            idleBox.isHidden = false
+        }
+    }
+
     private func layoutStats() {
         let size = statsLabel.intrinsicContentSize
         statsLabel.frame = NSRect(x: 8, y: bounds.height - 8 - size.height, width: size.width + 18, height: size.height)
     }
 
-    /// Schriftgrößen wie im Browser: clamp(28px, 3.1vw, 120px) bzw. clamp(13px, .95vw, 36px)
+    private func layoutCountdown() {
+        let w = bounds.width
+        countdownView.titleSize = min(84, max(22, (w * 0.022).rounded()))       // 45 pt bei 2048 pt
+        let s = countdownView.preferredSize
+        countdownView.frame = NSRect(x: ((bounds.width - s.width) / 2).rounded(), y: ((bounds.height - s.height) / 2).rounded(),
+                                     width: s.width, height: s.height)
+    }
+
+    private var pixelScale: CGFloat { scaleOverride ?? window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2 }
+
+    /// Schriftgrößen wie bisher im Browser: Titel clamp(28px, 3.1vw, 120px), Hinweis clamp(13px, .95vw, 36px)
     private func layoutIdle(animated: Bool = false) {
         let w = bounds.width, h = bounds.height
-        let big = min(120, max(28, w * 0.031)), small = min(36, max(13, w * 0.0095))
+        let big = min(120, max(28, w * 0.031))                 // 63,5 pt bei 2048 pt Breite
+        let small = min(36, max(13, w * 0.0095))               // 19,5 pt
+        let headSize = (big * 0.5).rounded()                   // 32 pt
+        let linkSize = max(11, (small * 0.8).rounded())        // 16 pt
         if titleLabel.font?.pointSize != big { titleLabel.font = .systemFont(ofSize: big, weight: .light) }
-        if subLabel.font?.pointSize != small { subLabel.font = .systemFont(ofSize: small, weight: .regular) }
-        let t = titleLabel.intrinsicContentSize, s = subLabel.intrinsicContentSize
-        let gap = small * 1.4
-        let bw = ceil(max(t.width, s.width)) + 4, bh = ceil(t.height + gap + s.height)
-        titleLabel.frame = NSRect(x: (bw - t.width) / 2, y: bh - t.height, width: t.width, height: t.height)
-        subLabel.frame = NSRect(x: (bw - s.width) / 2, y: 0, width: s.width, height: s.height)
-        // Versatz begrenzen, damit der Text immer ganz sichtbar bleibt
+        if headingLabel.font?.pointSize != headSize { headingLabel.font = .systemFont(ofSize: headSize, weight: .regular) }
+        if contextLabel.font?.pointSize != small { contextLabel.font = .systemFont(ofSize: small, weight: .regular) }
+        if linkLabel.font?.pointSize != linkSize { linkLabel.font = .systemFont(ofSize: linkSize, weight: .regular) }
+
+        let scale = pixelScale
+        func px(_ v: CGFloat) -> CGFloat { (v * scale).rounded() / scale }
+        let modules = qrView.code?.modules ?? 41
+        // ca. 20 % der Höhe (≈ 236 pt bei 1152 pt), auf ganze Pixel pro Modul gerundet → scharfe Module
+        let qr = QRCodeView.snappedSide(target: min(420, max(110, h * 0.205)), modules: modules, scale: scale)
+
+        let t = titleLabel.intrinsicContentSize, hd = headingLabel.intrinsicContentSize
+        let c = contextLabel.intrinsicContentSize, l = linkLabel.intrinsicContentSize
+        let gTitle = (big * 0.8).rounded()                     // Titel → Überschrift
+        let gHead = (headSize * 0.3).rounded()                 // Überschrift → Hinweis
+        let gQR = (small * 2.1).rounded()                      // Hinweis → QR
+        let gLink = (small * 0.85).rounded()                   // QR → Link
+        let bw = ceil(max(t.width, hd.width, c.width, l.width, qr)) + 4
+        let bh = ceil(t.height + gTitle + hd.height + gHead + c.height + gQR + qr + gLink + l.height)
+        func center(_ width: CGFloat) -> CGFloat { px((bw - width) / 2) }
+        var y: CGFloat = 0
+        linkLabel.frame = NSRect(x: center(l.width), y: y, width: l.width, height: l.height); y += l.height + gLink
+        qrView.frame = NSRect(x: center(qr), y: px(y), width: qr, height: qr); y += qr + gQR
+        contextLabel.frame = NSRect(x: center(c.width), y: y, width: c.width, height: c.height); y += c.height + gHead
+        headingLabel.frame = NSRect(x: center(hd.width), y: y, width: hd.width, height: hd.height); y += hd.height + gTitle
+        titleLabel.frame = NSRect(x: center(t.width), y: y, width: t.width, height: t.height)
+
+        // Versatz begrenzen, damit die Gruppe immer ganz sichtbar bleibt
         let dx = min(w * 0.16, max(0, (w - bw) / 2 - 16)) * shift.x
         let dy = min(h * 0.22, max(0, (h - bh) / 2 - 16)) * shift.y
         idleOffset = CGPoint(x: dx, y: dy)
@@ -748,9 +993,15 @@ final class PlayerRootView: NSView {
         }
     }
 
-    /// Einbrennschutz: Text alle 60 s langsam an eine andere Stelle schieben
+    /// Einbrennschutz: Gruppe alle 60 s langsam an eine andere Stelle schieben
     func shiftIdleText(animated: Bool) {
         shift = CGPoint(x: Double.random(in: -1...1), y: Double.random(in: -1...1))
         layoutIdle(animated: animated)
+    }
+
+    /// Für Vorschaubilder: Versatz fest vorgeben (-1…1)
+    func setShift(_ p: CGPoint) {
+        shift = p
+        layoutIdle()
     }
 }

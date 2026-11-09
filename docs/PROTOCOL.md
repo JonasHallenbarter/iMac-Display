@@ -102,3 +102,33 @@ Client auf „wartet auf Keyframe“ setzen, `onKeyframeRequested` (max. 1×/s) 
   Frames mit 8× Bitrate (erster als IDR), bis ~60 dB → Text praktisch verlustfrei. 60 fps → `avc1.64003c` (Level 6.0),
   30 fps → `avc1.640034` (Level 5.2).
   Statischer Bildschirm liefert keine neuen Frames → letzten Pixelbuffer cachen und für den Keyframe neu kodieren.
+
+## Erweiterung v2 (Steuerkanal, Verbinden-Knopf, Helligkeit) – verbindlich
+
+### Server → Client: `0x03` Steuer-Nachricht (Binary)
+
+`0x03` + UTF-8-JSON-Objekt mit Feld `"type"`. Unbekannte Typen ignorieren.
+
+| type | Beispiel | Bedeutung |
+|---|---|---|
+| `status` | `{"type":"status","active":false,"autoReconnect":true}` | **dauerhaft** (sticky): jeder neue Client bekommt ihn direkt nach der Config, alle Clients alle **2 s** erneut (= Lebenszeichen, der Empfänger verbindet im Bereitschaftszustand also nicht neu). `active:true` = virtuelles Display aktiv, Video kommt. `active:false` = MacBook bereit, aber (noch) nicht verbunden → Empfänger zeigt Leerlauf mit „Jetzt verbinden“ + QR. `autoReconnect` = MacBook verbindet automatisch, sobald der iMac da ist (Info). |
+| `brightness` | `{"type":"brightness","value":0.62}` | Helligkeit des iMac-Bildschirms setzen, 0.0 … 1.0. |
+
+Server-API (`StreamServer`): `broadcastControl(_ object: [String: Any], sticky: Bool = false)`.
+
+### Client → Server: Text-Nachrichten (zusätzlich)
+
+| Nachricht | Wann | Server-API |
+|---|---|---|
+| `{"type":"hello","app":"receiver","version":"1.3"}` | direkt nach dem Verbinden | `onClientMessage(ip, json)` |
+| `{"type":"brightness","supported":true,"value":0.62}` | nach dem Verbinden, nach jeder Änderung (auch über die iMac-Tasten, Abfrage alle 2 s), nach jedem Setzen | `onClientMessage(ip, json)` |
+
+`supported:false` → MacBook zeigt den Helligkeitsregler deaktiviert mit Hinweis.
+
+### Verbinden / automatisch wiederverbinden (MacBook)
+
+- Neuer dauerhafter Wunsch-Zustand **„verbunden“** (UserDefaults `connectWanted`, Standard `false`).
+- iMac-Client verbunden + Wunsch aus → **Bereitschaft**: kein virtuelles Display, `status active:false`; der große grüne Knopf leuchtet („Verbinden“), Menü „Jetzt verbinden“ aktiv.
+- Klick „Verbinden“ → Wunsch an → virtuelles Display + Stream, `status active:true`.
+- iMac weg (Kabel ab, iMac aus) → Display wird nach 10 s entfernt, Wunsch bleibt an → kommt der iMac wieder, wird **automatisch** wieder verbunden (auch nach Neustart der App).
+- „Trennen“ → Wunsch aus → Display weg, iMac zeigt „Jetzt verbinden“.

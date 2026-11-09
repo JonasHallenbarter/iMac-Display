@@ -27,6 +27,12 @@ final class StreamServer {
         set { callbackLock.withLock { _onClientStats = newValue } }
     }
 
+    /// Client hat eine andere Text-Nachricht geschickt (z. B. {"type":"brightness",...}): (Remote-IP, JSON). Beliebiger Thread.
+    var onClientMessage: ((String, [String: Any]) -> Void)? {
+        get { callbackLock.withLock { _onClientMessage } }
+        set { callbackLock.withLock { _onClientMessage = newValue } }
+    }
+
     // MARK: - Private state
 
     private let options: Options
@@ -39,6 +45,11 @@ final class StreamServer {
     private var _onClientConnected: (() -> Void)?
     private var _onKeyframeRequested: (() -> Void)?
     private var _onClientStats: ((String, [String: Any]) -> Void)?
+    private var _onClientMessage: ((String, [String: Any]) -> Void)?
+    /// Dauerhafte Steuer-Nachrichten (0x03) je "type": neue Clients bekommen sie direkt nach der Config,
+    /// alle Clients alle 2 s erneut (Lebenszeichen, damit der Empfänger im Bereitschaftszustand nicht neu verbindet).
+    private var stickyControls: [String: Data] = [:]
+    private var heartbeat: DispatchSourceTimer?
 
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: ClientConnection] = [:]
@@ -128,6 +139,14 @@ final class StreamServer {
             queue.sync { self.listener = nil }
             throw StreamServerError.listenFailed(port: options.port, underlying: err)
         }
+        queue.sync {
+            heartbeat?.cancel()
+            let t = DispatchSource.makeTimerSource(queue: queue)
+            t.schedule(deadline: .now() + 2, repeating: 2)
+            t.setEventHandler { [weak self] in self?.sendStickyControls(to: nil) }
+            t.resume()
+            heartbeat = t
+        }
         log("Server läuft auf Port \(options.port)"
             + (options.allowAnyNetwork ? " (alle Netze erlaubt)" : " (nur Loopback, 10.77.0.0/24, Link-Local)"))
     }
@@ -146,6 +165,8 @@ final class StreamServer {
                 l.cancel()
             }
             listener = nil
+            heartbeat?.cancel()
+            heartbeat = nil
             for c in connections.values { c.close(sendCloseFrame: true) }
             connections.removeAll()
             updateCount()
@@ -164,6 +185,28 @@ final class StreamServer {
                 // Nach Config-Wechsel braucht der Decoder einen frischen Keyframe.
                 c.markNeedsKeyframe()
             }
+        }
+    }
+
+    /// Steuer-Nachricht (0x03 + JSON) an alle verbundenen Clients. `sticky`: wird je "type" gespeichert, jedem
+    /// neuen Client nach der Config geschickt und alle 2 s wiederholt (z. B. "status"). Thread-safe.
+    func broadcastControl(_ object: [String: Any], sticky: Bool = false) {
+        guard let json = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return }
+        let type = object["type"] as? String ?? ""
+        queue.async {
+            if sticky { self.stickyControls[type] = json }
+            let frame = Self.makeBinaryFrame(prefix: [0x03], payload: json)
+            for c in self.connections.values where c.isOpen && c.isWebSocket { c.send(frame) }
+        }
+    }
+
+    /// Nur auf `queue`: alle dauerhaften Steuer-Nachrichten an einen Client bzw. (nil) an alle.
+    private func sendStickyControls(to client: ClientConnection?) {
+        guard !stickyControls.isEmpty else { return }
+        let targets = client.map { [$0] } ?? connections.values.filter { $0.isOpen && $0.isWebSocket }
+        for json in stickyControls.keys.sorted().compactMap({ stickyControls[$0] }) {
+            let frame = Self.makeBinaryFrame(prefix: [0x03], payload: json)
+            for c in targets { c.send(frame) }
         }
     }
 
@@ -255,6 +298,7 @@ final class StreamServer {
         if let config {
             client.send(Self.makeBinaryFrame(prefix: [0x01], payload: config))
         }
+        sendStickyControls(to: client)
         client.markNeedsKeyframe()
         updateCount()
         log("WebSocket-Client \(client.ip) verbunden (\(clientCount) verbunden)")
@@ -286,7 +330,10 @@ final class StreamServer {
                 log("Stats von \(client.ip): " + parts.joined(separator: " "))
             }
         default:
-            break
+            if let cb = onClientMessage {
+                let ip = client.ip
+                callbackQueue.async { cb(ip, obj) }
+            }
         }
     }
 

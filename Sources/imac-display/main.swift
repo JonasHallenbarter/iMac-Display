@@ -40,6 +40,18 @@ struct CLIOptions {
     var testActions = false
     /// Test: virtuelles Display an-/abbauen, aber nichts aufnehmen (ohne Bildschirmaufnahme-Berechtigung testbar).
     var noCapture = false
+    /// CLI: erst nach „Verbinden“ verbinden (Wunsch wird gespeichert) – wie die App. Standard im CLI: automatisch.
+    var manualConnect = false
+    /// Verbindungswunsch beim Start auf „an“ setzen (Test).
+    var connect = false
+    /// Eigene UserDefaults-Domäne (Test), damit die Einstellungen der installierten App unberührt bleiben.
+    var defaultsSuite: String?
+    /// App-Modus: Protokoll in diese Datei statt ~/Library/Logs/iMacDisplay.log (Test).
+    var logFile: String?
+    /// Test: Befehle auf stdin (state, press, connect, disconnect, brightness …).
+    var testStdin = false
+    /// Seriennummer des virtuellen Displays (Test neben der installierten App: muss sich unterscheiden).
+    var displaySerial: UInt32 = 0x0A770001
 }
 
 let usage = """
@@ -65,6 +77,15 @@ Verwendung: imac-display [Optionen]
   --test-pattern        Kein virtuelles Display/keine Aufnahme: synthetisches Testbild streamen
                         (Test von Server/Browser ohne Bildschirmaufnahme-Berechtigung)
   --no-capture          Test: Display an-/abbauen, aber keine Bildschirmaufnahme starten
+  --manual-connect      Erst nach „Verbinden“ verbinden, Wunsch wird gespeichert (wie die App;
+                        Standard im Terminal: automatisch verbinden, sobald der iMac da ist)
+  --connect             Verbindungswunsch beim Start einschalten
+  --defaults-suite <n>  Einstellungen in der Domäne <n> statt der Standard-Domäne (Test)
+  --log-file <pfad>     App-Modus: Protokoll in diese Datei (Test; Standard ~/Library/Logs/iMacDisplay.log)
+  --display-serial <hex> Seriennummer des virtuellen Displays (Test neben der installierten App;
+                        Standard 0A770001)
+  --test-stdin          Test: Befehle auf stdin (state, press, connect, disconnect, brightness <0…1>,
+                        drag, step, menu, menuclick <Titel>, transmission on|off, quit)
   --setup-window        Fenster „Einrichtung & Status“ beim Start öffnen (auch im CLI-Modus)
   --dry-run             Systemänderungen (Netzwerk, Berechtigung, Anmeldeobjekt, Deinstallation) nur
                         protokollieren (auch per Umgebungsvariable IMAC_DISPLAY_DRY_RUN=1)
@@ -74,6 +95,7 @@ Verwendung: imac-display [Optionen]
                         (Netzwerkdienst für den Test: IMAC_DISPLAY_TEST_SERVICE="<Dienstname>")
   --test-uninstall-dry-run Test: Deinstallation im Dry-Run
   Signal USR1 (kill -USR1 <pid>) schaltet „Übertragung aktiv“ um (Test).
+  Signal USR2 (kill -USR2 <pid>) drückt den großen Knopf: „Verbinden“ bzw. „Trennen“ (Test).
   -h, --help            Diese Hilfe
 
 """
@@ -126,6 +148,15 @@ func parseCLI(_ args: [String]) -> CLIOptions {
         case "--selftest-setup": o.selftestSetup = true
         case "--test-uninstall-dry-run": o.testUninstall = true; o.dryRun = true
         case "--test-actions-dry-run": o.testActions = true; o.dryRun = true
+        case "--manual-connect": o.manualConnect = true
+        case "--connect": o.connect = true
+        case "--defaults-suite": o.defaultsSuite = value(a)
+        case "--log-file": o.logFile = value(a)
+        case "--test-stdin": o.testStdin = true
+        case "--display-serial":
+            let v = value(a)
+            guard let n = UInt32(v.hasPrefix("0x") ? String(v.dropFirst(2)) : v, radix: 16) else { fail("Ungültiger Wert für --display-serial: \(v)") }
+            o.displaySerial = n
         case "-h", "--help":
             print(usage)
             exit(0)
@@ -344,7 +375,7 @@ if opts.unregisterLoginItem {
     exit(0)
 }
 
-if appMode, let id = Bundle.main.bundleIdentifier,
+if appMode, opts.defaultsSuite == nil, let id = Bundle.main.bundleIdentifier,
    NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0.processIdentifier != getpid() }) {
     // Zweiter Start (z. B. eine Kopie aus dem Disk-Image): Fenster der laufenden Instanz öffnen, selbst beenden.
     // Vor AppLog.startFileLogging, damit das Protokoll der laufenden Instanz nicht geleert wird.
@@ -356,10 +387,10 @@ if appMode, let id = Bundle.main.bundleIdentifier,
 
 if appMode {
     // Einstellungen für den App-Modus (optional): defaults write de.local.imac-display bitrate -float 80
-    let ud = UserDefaults.standard
+    let ud = opts.defaultsSuite.flatMap { UserDefaults(suiteName: $0) } ?? .standard
     if let v = ud.object(forKey: "fps") as? NSNumber, (1...240).contains(v.intValue) { opts.fps = v.intValue }
     if let v = ud.object(forKey: "bitrate") as? NSNumber, v.doubleValue > 0, v.doubleValue <= 1000 { opts.bitrate = v.doubleValue }
-    AppLog.startFileLogging(path: AppLog.defaultPath)
+    AppLog.startFileLogging(path: opts.logFile ?? AppLog.defaultPath)
     logLine("iMac Display \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?") gestartet (App-Modus, \(Bundle.main.bundlePath))")
 }
 

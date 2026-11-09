@@ -21,7 +21,8 @@ APP_NAME="iMac Display Empfänger"
 APP="$DIST/$APP_NAME.app"
 DMG="$DIST/iMac-Display-Empfaenger.dmg"
 EXE="iMacDisplayReceiver"
-VERSION="1.0"
+VERSION="$(sed -n 's/.*static let version = "\(.*\)".*/\1/p' "$PKG/Sources/iMacDisplayReceiver/Config.swift")"
+[ -n "$VERSION" ] || { echo "FEHLER: Version nicht in Config.swift gefunden" >&2; exit 1; }
 SCRATCH="${TMPDIR:-/tmp}"; SCRATCH="${SCRATCH%/}/imac-display-receiver-build"
 
 while [ $# -gt 0 ]; do
@@ -33,7 +34,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-echo "==> Baue $EXE (Universal arm64 + x86_64, macOS 12+) ..."
+echo "==> Baue $EXE $VERSION (Universal arm64 + x86_64, macOS 12+) ..."
 (cd "$PKG" && swift build -c release --arch arm64 --arch x86_64 --scratch-path "$SCRATCH")
 BIN="$SCRATCH/apple/Products/Release/$EXE"
 [ -x "$BIN" ] || { echo "FEHLER: $BIN nicht gefunden" >&2; exit 1; }
@@ -62,12 +63,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleDisplayName</key><string>$APP_NAME</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
-	<key>CFBundleVersion</key><string>1</string>
+	<key>CFBundleVersion</key><string>$VERSION</string>
 	<key>LSMinimumSystemVersion</key><string>12.0</string>
 	<key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
 	<key>LSUIElement</key><false/>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
+	<key>NSAppleEventsUsageDescription</key><string>„$APP_NAME“ schaltet den iMac nach 10 Minuten ohne Bild automatisch aus (in der App abschaltbar). Dazu schickt die App das normale Ausschalten-Signal an macOS (loginwindow).</string>
 	<key>NSHumanReadableCopyright</key><string>Empfänger für iMac Display (Ethernet-Direktverbindung)</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
@@ -109,11 +111,30 @@ ein Browser (Google Chrome o. ä.) ist NICHT nötig.
    - Ethernet-Kabel steckt
    - Netzwerkadresse 10.77.0.2 („Einrichten …“, Admin-Passwort; ändert nur den Ethernet-Dienst,
      WLAN/Internet bleiben; die alte Einstellung wird gesichert, „Zurücksetzen“ stellt sie exakt wieder her)
-   - MacBook erreichbar (dort die App starten und „Übertragung aktiv“ einschalten)
+   - MacBook erreichbar (dort die App „iMac Display“ starten)
    - Monitor-Modus: das Bild des MacBooks im Vollbild, startet von selbst.
-     Ohne Übertragung steht dort „Aktuell kein aktiver Monitor“.
+     Ohne Bild steht dort „Aktuell kein aktiver Monitor“, darunter „Jetzt verbinden“ mit einem
+     QR-Code und dem Link github.com/JonasHallenbarter/iMac-Display (Projektseite mit Anleitung
+     und der MacBook-App). Ist das MacBook angeschlossen, aber noch nicht verbunden:
+     dort in „iMac Display“ auf „Verbinden“ klicken – danach verbindet es sich künftig von selbst.
    - Bild vom MacBook: zeigt im Monitor-Modus, ob ein Bild ankommt (z. B. „Läuft · 52 fps“)
+   - Helligkeit: die Helligkeit dieses iMac lässt sich am MacBook in „iMac Display“ einstellen
+     (die Helligkeitstasten am iMac funktionieren weiterhin)
    - Autostart: startet den Monitor-Modus bei jeder Anmeldung (jederzeit wieder ausschaltbar).
+   - Automatisch ausschalten nach 10 Min. ohne Bild (Standard: an, siehe unten).
+
+Automatisch ausschalten
+   Kommt 10 Minuten lang kein Bild vom MacBook und benutzt niemand Maus oder Tastatur dieses iMac,
+   erscheint 60 Sekunden lang groß: „Der iMac wird in 60 Sekunden ausgeschaltet – Maus bewegen oder
+   Taste drücken zum Abbrechen.“ Maus bewegen oder eine Taste drücken bricht ab (die 10 Minuten
+   beginnen dann neu); kommt ein Bild vom MacBook, wird ebenfalls abgebrochen. Danach schaltet sich
+   der iMac ganz normal aus (wie Apple-Menü > Ausschalten). Ein Programm mit ungesicherten
+   Änderungen kann das verhindern.
+   Beim ersten Mal fragt macOS, ob „iMac Display Empfänger“ „loginwindow“ steuern darf: „OK“ wählen.
+   Am besten gleich beim Einrichten: in der Checkliste bei „Automatisch ausschalten“ auf „Erlauben …“.
+   AUSSCHALTEN der Funktion: in der Checkliste Zeile „Automatisch ausschalten nach 10 Min. ohne Bild“
+   den Schalter rechts ausschalten (wird gespeichert). Die Erlaubnis lässt sich unter
+   Systemeinstellungen > Sicherheit & Datenschutz > Datenschutz > Automation wieder entziehen.
 
 Vollbild beenden: Cmd+Q – dann erscheint das Fenster mit der Checkliste wieder
 (nochmals Cmd+Q beendet die App). Esc beendet bewusst nichts.
@@ -125,8 +146,10 @@ Was die App am System ändert – nur nach einem Klick, alles umkehrbar:
    - Autostart: nur die Datei ~/Library/LaunchAgents/de.local.imac-display-receiver.plist (kein Admin)
    - Einstellungen unter ~/Library/Application Support/iMacDisplay
    - Protokoll: ~/Library/Logs/iMacDisplayReceiver.log
-   - Solange der Monitor-Modus läuft, schläft der Rechner nicht automatisch ein (der Bildschirm schon,
-     solange kein MacBook da ist). Wird beim Beenden sofort freigegeben; keine Energie-Einstellung wird geändert.
+   - Solange der Monitor-Modus läuft bzw. „Automatisch ausschalten“ an ist, schläft der Rechner nicht
+     automatisch ein (der Bildschirm schon, solange kein MacBook da ist) – stattdessen schaltet er sich
+     nach 10 Min. ohne Bild aus. Wird beim Beenden sofort freigegeben; keine Energie-Einstellung wird geändert.
+   - Automatisch ausschalten: schickt das normale Ausschalten-Signal an macOS (keine Einstellung wird geändert)
 
 Entfernen: In der App unten „Deinstallieren …“ – Autostart, Netzwerk, Daten und App einzeln wählbar.
 Protokoll: In der App unten „Protokoll anzeigen“.
@@ -145,6 +168,10 @@ ok=1
 [ -L "$MNT/Programme" ] && [ "$(readlink "$MNT/Programme")" = /Applications ] || ok=0
 [ -f "$MNT/LIESMICH.txt" ] || ok=0
 grep -q "Version 94" "$MNT/LIESMICH.txt" && { echo "FEHLER: LIESMICH verlangt noch Chrome" >&2; ok=0; }
+grep -q "Jetzt verbinden" "$MNT/LIESMICH.txt" && grep -q "Automatisch ausschalten" "$MNT/LIESMICH.txt" || { echo "FEHLER: LIESMICH unvollständig" >&2; ok=0; }
+PL="$MNT/$APP_NAME.app/Contents/Info.plist"
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PL")" = "$VERSION" ] || { echo "FEHLER: Version im Info.plist" >&2; ok=0; }
+/usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$PL" >/dev/null || { echo "FEHLER: NSAppleEventsUsageDescription fehlt" >&2; ok=0; }
 lipo "$MNT/$APP_NAME.app/Contents/MacOS/$EXE" -verify_arch x86_64 arm64 || ok=0
 codesign --verify --deep --strict "$MNT/$APP_NAME.app" || ok=0
 ls -la "$MNT" | sed '1d; s/^/    /'
